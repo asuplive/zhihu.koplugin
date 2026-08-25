@@ -194,6 +194,13 @@ local function cleanHtmlForEpub(html)
     -- Now safe to remove data-* attributes
     html = html:gsub('%sdata%-[^=]-="[^"]*"', "")
     html = html:gsub("%sdata%-[^=]-='[^']*'", "")
+    -- Remove fixed width/height so CSS max-width:100% works properly
+    html = html:gsub(' width="%d+"', "")
+    html = html:gsub(' width=%d+', "")
+    html = html:gsub(' height="%d+"', "")
+    html = html:gsub(' height=%d+', "")
+    html = html:gsub(" width='%d+'", "")
+    html = html:gsub(" height='%d+'", "")
     return html
 end
 

@@ -1,4 +1,4 @@
-# Zhihu Reader for KOReader v71
+# Zhihu Reader for KOReader v74
 
 在 KOReader 中浏览知乎推荐流，支持二维码登录和整页翻页阅读，专为电子墨水屏设备优化。
 
@@ -7,7 +7,8 @@
 - 二维码扫码登录知乎账号（URL 文本方式）
 - 查看个性化推荐流（需登录）
 - 推荐列表带刷新按钮，加载更多内容
-- 整页翻页阅读（点击屏幕左右区域翻页）
+- **自定义文章阅读器**（基于 ScrollHtmlWidget，原生图文混排）
+- 整页翻页（点击屏幕左右区域翻页，符合阅读器习惯）
 - 字体大小调节（18/22/26/30 四档）
 - 导出为 HTML 文件（含 base64 内联图片，自动在 KOReader 中打开，支持整页翻页）
 
@@ -54,15 +55,19 @@ cp -r zhihu.koplugin /.kobo/koreader/plugins/
 
 1. 登录后，菜单中会出现「Recommended Feed」选项
 2. 点击进入，加载推荐内容列表
-3. 点击列表项查看详情（TextViewer 整页翻页阅读）
+3. 点击列表项查看详情（ArticleViewer 整页翻页阅读）
 4. 列表底部有「>>> Refresh >>>」按钮，点击加载更多推荐内容
 
-### 阅读文章
+### 阅读文章（v72 新增）
 
-TextViewer 支持：
-- 点击屏幕右侧 = 下一页，左侧 = 上一页
-- 硬件按键翻页
-- 点击标题栏关闭按钮或按返回键退出
+v72 使用基于 ScrollHtmlWidget 的自定义弹窗阅读器，替代了旧的 TextViewer：
+
+- **图文混排**：文字和图片在同一页面内显示，无需切换查看器
+- **整页翻页**：点击屏幕左/右半区翻页，符合阅读器习惯
+- **滑动滚动**：左右滑动翻页，上下滑动关闭阅读器
+- **返回键关闭**：按硬件返回键退出阅读器
+- **CSS 排版**：支持段落缩进、作者加粗、投票数样式、图片边框等
+- **图片本地缓存**：开启「显示图片」后，图片下载到临时目录，离线可看
 
 ### 调整字体大小
 
@@ -82,11 +87,19 @@ TextViewer 支持：
 zhihu.koplugin/
   _meta.lua           -- 插件元数据
   main.lua            -- 主逻辑（菜单、UI、二维码登录、翻页）
+  article_viewer.lua  -- 自定义文章阅读器（ScrollHtmlWidget 图文混排）
   zhihu_client.lua    -- HTTP 客户端（Cookie 管理、API 调用、HTML 解析）
   README.md           -- 本文件
 ```
 
 ## 技术说明
+
+### 阅读器架构（v72）
+
+- **ScrollHtmlWidget**：KOReader 内置的 HTML/CSS 渲染引擎（基于 MuPDF）
+- 图片下载到 `koreader/zhihu_article_images/` 临时目录
+- 通过 `html_resource_directory` 参数让 MuPDF 解析相对图片路径
+- CSS 注入控制排版样式（字体、行距、缩进、图片边框等）
 
 ### API 端点
 
@@ -115,6 +128,12 @@ zhihu.koplugin/
 2. 确认网络连接正常
 3. 尝试刷新推荐流
 
+### 阅读器中图片不显示
+
+1. 确认菜单中「Show Images」选项已开启
+2. 确认网络连接正常（首次加载需下载图片）
+3. 图片缓存目录：`koreader/zhihu_article_images/`
+
 ### 导出 HTML 失败
 
 1. 确认设备存储空间充足
@@ -122,6 +141,14 @@ zhihu.koplugin/
 3. 尝试重新导出
 
 ## 更新日志
+
+### v72
+- 新增 `article_viewer.lua`：基于 ScrollHtmlWidget 的自定义阅读弹窗
+- 替换 TextViewer 为 ArticleViewer，支持原生图文混排
+- 图片下载到本地临时目录，通过相对路径引用
+- 注入 CSS 控制排版（段落缩进、作者加粗、图片边框等）
+- 支持整页翻页（点击左/右半区）、滑动关闭、返回键关闭
+- 保留导出 HTML 功能（base64 内联图片独立流程）
 
 ### v68
 - 修复图片重复显示问题（知乎 noscript 块导致 img 标签重复）

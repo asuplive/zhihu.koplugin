@@ -1,9 +1,10 @@
 --[[
-    Zhihu Reader Plugin for KOReader v64
+    Zhihu Reader Plugin for KOReader v81
     - QR code login: ImageViewer with QR image
     - Recommended feed with refresh button
-    - TextViewer for reading (page turn by tap)
-    - Optional article image viewing
+    - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
+    - Close button in article viewer
+    - Mixed text and image display (图文混排)
     - Export to HTML with images
 ]]
 
@@ -18,10 +19,86 @@ local LuaSettings     = require("luasettings")
 local NetworkMgr      = require("ui/network/manager")
 local _               = require("gettext")
 local T               = require("ffi/util").template
+local Device          = require("device")
+local Screen          = Device.screen
 
-local ZhihuClient = require("zhihu_client")
+local ZhihuClient  = require("zhihu_client")
+local ArticleViewer = require("article_viewer")
 
 local DEFAULT_FONT_SIZE = 22
+
+-- CSS for ScrollHtmlWidget article rendering
+local ARTICLE_CSS = [[
+body {
+    font-family: "Noto Serif CJK SC", "WenQuanYi Micro Hei", serif;
+    line-height: 1.8;
+    color: #000;
+    margin: 0;
+    padding: 0px;
+}
+a {
+    color: #000;
+    font-weight: bold;
+    text-decoration: none;
+}
+.close-link {
+    float: right;
+    font-weight: bold;
+}
+
+.title {
+    font-weight: bold;
+    text-align: left;
+    border-bottom: 2px solid #000;
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+}
+.answer {
+    margin-bottom: 25px;
+    padding-bottom: 15px;
+    border-bottom: 1px dashed #888;
+}
+.author {
+    font-weight: bold;
+    margin-bottom: 3px;
+}
+.voteup {
+    color: #666;
+    margin-bottom: 10px;
+}
+p {
+    text-indent: 0.5em;
+    margin: 0 0 4px 0;
+}
+img {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 10px 0;
+    border: 1px solid #666;
+}
+blockquote {
+    border-left: 3px solid #888;
+    padding-left: 15px;
+    margin: 10px 0;
+}
+li {
+    margin-bottom: 8px;
+}
+code {
+    font-family: monospace;
+}
+pre {
+    padding: 10px;
+    border: 1px solid #888;
+    overflow-x: auto;
+}
+h2, h3 {
+    font-weight: bold;
+    margin: 15px 0 10px 0;
+}
+]]
 
 -- =========================================================================
 -- Plugin Module
@@ -158,7 +235,7 @@ function Zhihu:buildMenuItems()
         text = _("About"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v64\n\n- QR code login\n- Recommended feed with refresh\n- TextViewer reading\n- Article images\n- Export to HTML"),
+                text = _("Zhihu Reader v81\n\n- QR code login\n- Recommended feed with refresh\n- ArticleViewer with boundary close\n- Mixed text and images (图文混排)\n- Export to HTML"),
                 timeout = 5,
             })
         end,
@@ -418,7 +495,7 @@ function Zhihu:_loadRecommendFeed(offset)
 end
 
 -- =========================================================================
--- Read Article (TextViewer)
+-- Read Article (ArticleViewer with ScrollHtmlWidget)
 -- =========================================================================
 
 function Zhihu:showArticle(question_id, title, item_type)
@@ -428,55 +505,126 @@ function Zhihu:showArticle(question_id, title, item_type)
     end
 
     local show_images = self.settings:readSetting("show_images", false)
-    
+
     local loading = InfoMessage:new{
         text = T(_("Loading: %1"), title and #title > 30 and title:sub(1, 30) .. "..." or (title or "")),
         timeout = 0,
     }
     UIManager:show(loading)
 
-    local text, image_list
-    if show_images then
-        text, image_list = self.client:getAnswers(question_id, title, item_type, true)
-    else
-        text = self.client:getAnswers(question_id, title, item_type, false)
-    end
-    
-    UIManager:close(loading)
+    -- Get HTML content from zhihu_client
+    local html_content = self.client:getAnswersHtml(question_id, title, item_type)
 
-    if not text then
-        local last_err = self.client:getLastError() or ""
-        UIManager:show(InfoMessage:new{
-            text = T(_("Load failed: %1"), last_err),
-            timeout = 8,
-        })
-        return
+    if not html_content then
+        -- Fallback: try text version and wrap in basic HTML
+        local text = self.client:getAnswers(question_id, title, item_type, false)
+        UIManager:close(loading)
+        if not text then
+            local last_err = self.client:getLastError() or ""
+            UIManager:show(InfoMessage:new{
+                text = T(_("Load failed: %1"), last_err),
+                timeout = 8,
+            })
+            return
+        end
+        -- Convert plain text to simple HTML
+        html_content = "<div class='title'>" .. (title or "") .. "</div>"
+        local escaped = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+        escaped = escaped:gsub("\n\n", "</p><p>")
+        escaped = escaped:gsub("\n", "<br/>")
+        html_content = html_content .. "<p>" .. escaped .. "</p>"
+    else
+        UIManager:close(loading)
     end
 
     self.current_article = {
         question_id = question_id,
         title = title,
         item_type = item_type,
-        image_list = image_list or {},
+        image_list = {},
     }
 
-    -- Append image list at end of article text
-    if image_list and #image_list > 0 then
-        local sep = string.rep("-", 40)
-        local img_text = "\n\n" .. sep .. "\n图片列表:\n"
-        for i, url in ipairs(image_list) do
-            img_text = img_text .. "[图片" .. i .. "] " .. url .. "\n"
+    -- Handle images: download to local dir (if enabled) or strip from HTML
+    local image_dir = nil
+    if show_images then
+        local temp_dir = DataStorage:getDataDir() .. "/zhihu_article_images/"
+        os.execute("mkdir -p '" .. temp_dir .. "'")
+
+        -- Extract image URLs from HTML
+        local img_urls = {}
+        local seen = {}
+        html_content:gsub('<img[^>]-src="([^"]*)"', function(url)
+            if url and url ~= "" and not seen[url] then
+                seen[url] = true
+                table.insert(img_urls, url)
+            end
+        end)
+
+        -- Store URLs for backward-compatible View Images menu
+        self.current_article.image_list = img_urls
+
+        if #img_urls > 0 then
+            local url_to_file = {}
+            for i, url in ipairs(img_urls) do
+                local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
+                if ext == "webp" then ext = "jpg" end -- fallback for unsupported formats
+                local filename = string.format("img_%03d.%s", i, ext)
+                local filepath = temp_dir .. filename
+
+                local ok = pcall(function()
+                    self.client:_downloadImage(url, filepath)
+                end)
+
+                if ok then
+                    url_to_file[url] = filename
+                end
+            end
+
+            -- Replace remote URLs with local filenames in HTML
+            for url, filename in pairs(url_to_file) do
+                -- Escape pattern-special characters in URL
+                local esc_url = url:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
+                html_content = html_content:gsub(
+                    'src="' .. esc_url .. '"',
+                    'src="' .. filename .. '"'
+                )
+            end
+
+            if next(url_to_file) then
+                image_dir = temp_dir
+            end
         end
-        text = text .. img_text
+    else
+        -- show_images is off: replace img tags with placeholder text
+        html_content = html_content:gsub('<img[^>]*/>', '[图片]')
     end
 
     local font_size = self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)
-    UIManager:show(TextViewer:new{
-        title = title or "",
-        text = text,
-        text_face = Font:getFace("cfont", font_size),
-        justified = true,
-    })
+
+    -- Try ArticleViewer first, fallback to TextViewer if it crashes
+    local ok_viewer = pcall(function()
+        UIManager:show(ArticleViewer:new{
+            html_content = html_content,
+            css = ARTICLE_CSS,
+            image_dir = image_dir,
+            font_size = font_size,
+        })
+    end)
+
+    if not ok_viewer then
+        -- Fallback to plain TextViewer if ArticleViewer crashes
+        UIManager:show(InfoMessage:new{
+            text = _("Article viewer unavailable, using text mode."),
+            timeout = 2,
+        })
+        local plain_text = html_content:gsub("<[^>]-[>]-", ""):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
+        UIManager:show(TextViewer:new{
+            title = title or "",
+            text = plain_text,
+            text_face = Font:getFace("cfont", font_size),
+            justified = true,
+        })
+    end
 end
 
 -- =========================================================================
