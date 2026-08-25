@@ -1,4 +1,4 @@
-# Zhihu Reader for KOReader v37
+# Zhihu Reader for KOReader v71
 
 在 KOReader 中浏览知乎推荐流，支持二维码登录和整页翻页阅读，专为电子墨水屏设备优化。
 
@@ -9,6 +9,7 @@
 - 推荐列表带刷新按钮，加载更多内容
 - 整页翻页阅读（点击屏幕左右区域翻页）
 - 字体大小调节（18/22/26/30 四档）
+- 导出为 HTML 文件（含 base64 内联图片，自动在 KOReader 中打开，支持整页翻页）
 
 ## 安装方法
 
@@ -67,6 +68,14 @@ TextViewer 支持：
 
 主菜单 → 工具 → Zhihu Reader → Font Size → 选择合适的大小
 
+### 导出 HTML
+
+阅读回答时选择菜单中的 **Export HTML**：
+- 自动下载图片并内联为 base64 编码（无需网络即可查看图片）
+- 导出后自动在 KOReader 中打开
+- 支持整页翻页阅读
+- 图片文件仍保存到 `images/` 文件夹，方便单独查看
+
 ## 目录结构
 
 ```
@@ -81,38 +90,49 @@ zhihu.koplugin/
 
 ### API 端点
 
-| 功能 | API 端点 |
-|------|----------|
-| 推荐流 | `api/v4/feed/topstory/recommend?limit=20` |
-| 回答 | `api/v4/questions/{id}/answers?limit=5` → HTML fallback |
-| 专栏文章 | `zhuanlan.zhihu.com/p/{id}` |
-| 用户名 | `api/v4/me` |
-| QR token | `api/v3/account/api/login/qrcode` (POST) |
-| QR 状态 | `api/v3/account/api/login/qrcode/{token}/scan_info` |
+- 推荐流：`https://www.zhihu.com/api/v4/moments?limit=5`
+- 回答详情：`https://www.zhihu.com/api/v4/questions/{id}/answers?limit=5`
+- 文章详情：`https://zhuanlan.zhihu.com/p/{id}`
+- 二维码：`https://www.zhihu.com/api/v3/account/api/login/qrcode`
 
-### Cookie 管理
+### 已知限制
 
-- CookieJar 管理所有 HTTP Cookie
-- Cookie 持久化到 `koreader/settings/zhihu_cookies.lua`
-- 关键 Cookie：`_xsrf`（CSRF）、`d_c0`（设备标识）、`z_c0`（登录凭证）
-- 用户名缓存：登录后缓存用户名，避免每次打开菜单都发起 API 请求
+- 部分功能需要登录后的 Cookie
+- 二维码有效期约 2 分钟
+- 推荐流需要已登录状态
 
-## 常见问题
+## 故障排除
 
-### Q: 为什么不用二维码图片显示？
+### 插件不显示在菜单中
 
-Android 端 KOReader 的 `ImageViewer` 组件存在稳定性问题，会导致 `pthread_mutex_lock on destroyed mutex` 崩溃。v31 改用 URL 文本方式，更稳定可靠。
+1. 确认 `_meta.lua` 文件存在且没有语法错误
+2. 确认插件目录路径正确
+3. 重启 KOReader
 
-### Q: 错误信息中的括号内容是什么？
+### 无法获取推荐
 
-错误信息格式如 `Load failed: unknown (Page HTTP 403)`，括号内是具体失败步骤，方便诊断。
+1. 确认已登录（菜单中显示用户名）
+2. 确认网络连接正常
+3. 尝试刷新推荐流
 
-## 兼容性
+### 导出 HTML 失败
 
-- KOReader 2022.01+
-- 需要 `ssl.https`、`ltn12`、`socketutil`、`rapidjson`（dkjson 回退）、`NetworkMgr`
-- 支持 Kindle / Kobo / PocketBook / Android 等所有 KOReader 支持的平台
-- 越狱 Kindle 推荐使用
+1. 确认设备存储空间充足
+2. 检查错误提示中的路径信息
+3. 尝试重新导出
+
+## 更新日志
+
+### v68
+- 修复图片重复显示问题（知乎 noscript 块导致 img 标签重复）
+- 图片内联为 base64，无需依赖文件路径
+- 优化 e-ink 屏幕排版（更大字号、更高对比度）
+
+### v67
+- 支持导出为 HTML 文件（含图片，自动打开）
+- 支持 base64 内联图片
+- 修复 HTML 文件写入失败问题
+- 优化 e-ink 屏幕排版
 
 ## 许可证
 

@@ -1,5 +1,5 @@
 --[[
-    Zhihu Client Module for KOReader  (v28)
+    Zhihu Client Module for KOReader  (v39)
     - EPUB content generation (HTML format)
     - Synchronous HTTP, robust cookie parsing
 ]]
@@ -41,11 +41,44 @@ local function codepointToUTF8(num)
     return ""
 end
 
-local function htmlToText(html)
-    if not html or html == "" then return "" end
+local function htmlToText(html, keep_images)
+    if not html or html == "" then return "", {} end
+    local image_list = {}
+    -- Extract image URLs BEFORE removing noscript (zhihu wraps imgs in noscript)
+    if keep_images then
+        local seen_urls = {}
+        html = html:gsub("<noscript[^>]*>", "")
+        html = html:gsub("</noscript>", "")
+        local img_count = 0
+        html = html:gsub("<img[^>]*>", function(tag)
+            img_count = img_count + 1
+            local url = nil
+            local s = tag:find('data-actualsrc="', 1, true)
+            if s then
+                local e = tag:find('"', s + 16, true)
+                if e then url = tag:sub(s + 16, e - 1) end
+            end
+            if not url or url == "" then
+                s = tag:find(' src="', 1, true)
+                if s then
+                    local e = tag:find('"', s + 6, true)
+                    if e then url = tag:sub(s + 6, e - 1) end
+                end
+            end
+            if url and #url > 0 and not seen_urls[url] then
+                seen_urls[url] = true
+                table.insert(image_list, url)
+            end
+            return "[图片" .. img_count .. "]"
+        end)
+    else
+        html = html:gsub("<noscript[^>]*>.-</noscript>", "")
+        html = html:gsub("<img[^>]*>", "")
+    end
+    html = html:gsub("<b>(.-)</b>", "**%1**")
+    html = html:gsub("<strong>(.-)</strong>", "**%1**")
     html = html:gsub("<script[^>]*>.-</script>", "")
     html = html:gsub("<style[^>]*>.-</style>", "")
-    html = html:gsub("<noscript[^>]*>.-</noscript>", "")
     html = html:gsub("<!%-%-.-%-%->", "")
     html = html:gsub("<br[^>]*/?>", "\n")
     html = html:gsub("</p>", "\n\n")
@@ -84,7 +117,7 @@ local function htmlToText(html)
     html = html:gsub("\n ", "\n")
     html = html:gsub("^%s+", "")
     html = html:gsub("%s+$", "")
-    return html
+    return html, image_list
 end
 
 local function decodeJSON(text)
@@ -110,21 +143,55 @@ local function escapeXml(text)
     return text
 end
 
--- Clean HTML content for EPUB: remove scripts/styles, fix self-closing tags
+-- Format Unix timestamp to YYYY-MM-DD HH:MM
+local function formatTime(unix_timestamp)
+    if not unix_timestamp then return "" end
+    -- Convert string to number if needed
+    local ts = tonumber(unix_timestamp)
+    if not ts then return "" end
+    -- os.date may not handle timezone correctly on embedded devices,
+    -- but gives a reasonable approximation
+    local ok, result = pcall(function()
+        return os.date("%Y-%m-%d %H:%M", ts)
+    end)
+    if ok and result then return result end
+    return ""
+end
+
+-- Clean HTML content for export: remove scripts/styles, fix images
 local function cleanHtmlForEpub(html)
     if not html or html == "" then return "<p>(no content)</p>" end
     html = html:gsub("<script[^>]*>.-</script>", "")
     html = html:gsub("<style[^>]*>.-</style>", "")
+    -- Remove entire noscript blocks (zhihu puts duplicate img in noscript)
     html = html:gsub("<noscript[^>]*>.-</noscript>", "")
     html = html:gsub("<!%-%-.-%-%->", "")
     html = html:gsub("<br[^>]*/?>", "<br/>")
     html = html:gsub("<hr[^>]*/?>", "<hr/>")
-    html = html:gsub("<img([^>]-)>", function(attrs)
+    -- Fix img tags: copy data-actualsrc to src BEFORE removing data-* attrs
+    html = html:gsub("<img([^>]*)>", function(attrs)
+        -- Ensure self-closing
         if attrs:sub(-1) ~= "/" then
-            return "<img" .. attrs .. "/>"
+            attrs = attrs .. "/"
         end
-        return "<img" .. attrs
+        -- If data-actualsrc exists, use it as src (zhihu lazy-load)
+        local actual_src = attrs:match('data%-actualsrc="([^"]*)"')
+        if not actual_src then
+            actual_src = attrs:match("data%-actualsrc='([^']*)'")
+        end
+        if actual_src and actual_src ~= "" then
+            -- Replace existing src or add new one (use function to avoid % in URL)
+            if attrs:find(' src="') then
+                attrs = attrs:gsub(' src="[^"]*"', function() return ' src="' .. actual_src .. '"' end)
+            elseif attrs:find(" src='") then
+                attrs = attrs:gsub(" src='[^']*'", function() return " src='" .. actual_src .. "'" end)
+            else
+                attrs = ' src="' .. actual_src .. '"' .. attrs
+            end
+        end
+        return "<img" .. attrs .. ">"
     end)
+    -- Now safe to remove data-* attributes
     html = html:gsub('%sdata%-[^=]-="[^"]*"', "")
     html = html:gsub("%sdata%-[^=]-='[^']*'", "")
     return html
@@ -199,8 +266,7 @@ function CookieJar:parseSetCookie(header_value)
     for _, cookie_str in ipairs(cookies) do
         local segments = {}
         for seg in cookie_str:gmatch("([^;]+)") do
-            local trimmed = seg:gsub("^%s+", "")
-            table.insert(segments, trimmed)
+            table.insert(segments, (seg:gsub("^%s+", "")))
         end
         if #segments > 0 then
             local first = segments[1]
@@ -378,6 +444,11 @@ function ZhihuClient:downloadFile(url, filepath, referer)
     if not f then return nil, "Cannot open file" end
     f:write(body) f:close()
     return true
+end
+
+-- Alias for image download (used by showImage)
+function ZhihuClient:_downloadImage(url, filepath)
+    return self:downloadFile(url, filepath, "https://www.zhihu.com/")
 end
 
 -- =========================================================================
@@ -602,7 +673,7 @@ function ZhihuClient:getRecommendFeed()
         if target.author and target.author.name then
             author = target.author.name
         end
-        local content = htmlToText(target.content or "")
+        local content, images = htmlToText(target.content or "", true)
         local voteup = target.voteup_count or 0
 
         if title ~= "" or question_id then
@@ -614,6 +685,7 @@ function ZhihuClient:getRecommendFeed()
                 author      = author,
                 content     = content,
                 voteup      = voteup,
+                images      = images or {},
             })
         end
     end
@@ -699,7 +771,7 @@ end
 --   Strategy 2: Question page HTML with correct Referer (fallback)
 -- =========================================================================
 
-function ZhihuClient:getAnswers(question_id, title, item_type)
+function ZhihuClient:getAnswers(question_id, title, item_type, show_images)
     if not question_id or question_id == "" then
         return nil, "No question ID"
     end
@@ -711,19 +783,19 @@ function ZhihuClient:getAnswers(question_id, title, item_type)
     end
 
     if item_type == "article" then
-        return self:_getArticleContent(question_id, title)
+        return self:_getArticleContent(question_id, title, show_images)
     end
 
     -- Strategy 1: Simplified API (remove long include param that triggers 403)
-    local text = self:_getAnswersViaApi(question_id, title)
-    if text then return text end
+    local text, images = self:_getAnswersViaApi(question_id, title, show_images)
+    if text then return text, images end
 
     -- Strategy 2: HTML page with correct Referer
     logger.info("[Zhihu] API failed, trying HTML page for:", question_id)
-    return self:_getAnswersViaPage(question_id, title)
+    return self:_getAnswersViaPage(question_id, title, show_images)
 end
 
-function ZhihuClient:_getAnswersViaApi(question_id, title)
+function ZhihuClient:_getAnswersViaApi(question_id, title, show_images)
     -- v35: add include=content to get answer body
     local url = "https://www.zhihu.com/api/v4/questions/" .. question_id
         .. "/answers?limit=5&offset=0&include=data[*].content"
@@ -742,10 +814,10 @@ function ZhihuClient:_getAnswersViaApi(question_id, title)
         return nil
     end
 
-    return self:_formatAnswers(data.data, title)
+    return self:_formatAnswers(data.data, title, show_images)
 end
 
-function ZhihuClient:_getAnswersViaPage(question_id, title)
+function ZhihuClient:_getAnswersViaPage(question_id, title, show_images)
     local url = "https://www.zhihu.com/question/" .. question_id
     -- v18 fix: use question URL as referer (not generic zhihu.com)
     local body, code = self:_request(url, "GET", url)
@@ -757,7 +829,7 @@ function ZhihuClient:_getAnswersViaPage(question_id, title)
 
     -- Check if redirected to article
     if body:match("zhuanlan") and body:match("article") then
-        return self:_getArticleContent(question_id, title)
+        return self:_getArticleContent(question_id, title, show_images)
     end
 
     local data = extractInitialData(body)
@@ -829,7 +901,7 @@ function ZhihuClient:_getAnswersViaPage(question_id, title)
                 voteup_count = 0,
                 content = excerpt,
             }}
-            return self:_formatAnswers(formatted, title)
+            return self:_formatAnswers(formatted, title, show_images)
         end
         self.last_error = "No answers or question data"
         return nil
@@ -844,10 +916,10 @@ function ZhihuClient:_getAnswersViaPage(question_id, title)
         })
     end
 
-    return self:_formatAnswers(formatted, title)
+    return self:_formatAnswers(formatted, title, show_images)
 end
 
-function ZhihuClient:_getArticleContent(article_id, title)
+function ZhihuClient:_getArticleContent(article_id, title, show_images)
     local url = "https://zhuanlan.zhihu.com/p/" .. article_id
     local body, code = self:_request(url, "GET", "https://www.zhihu.com/")
 
@@ -903,13 +975,14 @@ function ZhihuClient:_getArticleContent(article_id, title)
         content = content,
     }}
 
-    return self:_formatAnswers(formatted, title)
+    return self:_formatAnswers(formatted, title, show_images)
 end
 
-function ZhihuClient:_formatAnswers(answers, title)
-    if not answers or #answers == 0 then return nil end
+function ZhihuClient:_formatAnswers(answers, title, show_images)
+    if not answers or #answers == 0 then return nil, {} end
 
     local parts = {}
+    local all_images = {}
     if title then
         table.insert(parts, title)
         table.insert(parts, SEPARATOR)
@@ -919,10 +992,20 @@ function ZhihuClient:_formatAnswers(answers, title)
     for i, answer in ipairs(answers) do
         local author = (answer.author and answer.author.name) or "Anonymous"
         local voteup = answer.voteup_count or answer.voteupCount or 0
-        local content = htmlToText(answer.content or "")
+        local content, images = htmlToText(answer.content or "", show_images)
+        if images and #images > 0 then
+            for _, img in ipairs(images) do
+                table.insert(all_images, img)
+            end
+        end
         if content == "" then content = "(content not available)" end
 
-        table.insert(parts, string.format("[%d] %s   %s", i, author, voteup .. " votes"))
+        local time_str = formatTime(answer.created_time or answer.createdTime)
+        if time_str ~= "" then
+            time_str = "  ·  " .. time_str
+        end
+
+        table.insert(parts, string.format("[%d] %s   %s%s", i, author, voteup .. " votes", time_str))
         table.insert(parts, "")
         table.insert(parts, content)
         table.insert(parts, "")
@@ -930,7 +1013,7 @@ function ZhihuClient:_formatAnswers(answers, title)
         table.insert(parts, "")
     end
 
-    return table.concat(parts, "\n")
+    return table.concat(parts, "\n"), all_images
 end
 
 function ZhihuClient:getRawQuestionHtml(question_id)
@@ -960,7 +1043,7 @@ function ZhihuClient:_formatAnswersHtml(answers, title)
 
     local parts = {}
     if title then
-        table.insert(parts, '<h1>' .. escapeXml(title) .. '</h1>')
+        table.insert(parts, '<div class="title">' .. escapeXml(title) .. '</div>')
     end
 
     for i, answer in ipairs(answers) do
@@ -971,9 +1054,15 @@ function ZhihuClient:_formatAnswersHtml(answers, title)
         content = cleanHtmlForEpub(content)
         if content == "" then content = '<p>(content not available)</p>' end
 
+        local time_str = formatTime(answer.created_time or answer.createdTime)
+        local meta_line = voteup .. " votes"
+        if time_str ~= "" then
+            meta_line = meta_line .. "  ·  " .. time_str
+        end
+
         table.insert(parts, string.format(
-            '<div class="answer"><p class="author">%s</p><p class="voteup">%d votes</p>%s</div>',
-            escapeXml(author), voteup, content
+            '<div class="answer"><p class="author">%s</p><p class="voteup">%s</p>%s</div>',
+            escapeXml(author), meta_line, content
         ))
     end
 
@@ -997,7 +1086,7 @@ function ZhihuClient:getAnswersHtml(question_id, title, item_type)
 
     -- Strategy 1: Answers API
     local url = "https://www.zhihu.com/api/v4/questions/" .. question_id
-        .. "/answers?limit=5&offset=0"
+        .. "/answers?limit=5&offset=0&include=data[*].content"
     local qurl = "https://www.zhihu.com/question/" .. question_id
     local body, code = self:_request(url, "GET", qurl)
 

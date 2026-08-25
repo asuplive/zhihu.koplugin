@@ -7,5 +7,6 @@ Features:
 - QR code login (scan URL with Zhihu app)
 - Recommended feed with refresh button (requires login)
 - Read question answers with page turn
+- Article images (optional, viewable in image viewer)
 - Adjustable font size]]),
 }
