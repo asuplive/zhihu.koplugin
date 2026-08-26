@@ -1,9 +1,9 @@
 --[[
-    Zhihu Reader Plugin for KOReader v81
+    Zhihu Reader Plugin for KOReader v89
     - QR code login: ImageViewer with QR image
     - Recommended feed with refresh button
     - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
-    - Close button in article viewer
+    - Close button (X icon) in article viewer top-right (Tap handler fix)
     - Mixed text and image display (图文混排)
     - Export to HTML with images
 ]]
@@ -22,10 +22,17 @@ local T               = require("ffi/util").template
 local Device          = require("device")
 local Screen          = Device.screen
 
+-- QR login: Trapper + ImageViewer (v7 proven stable on Android)
+local Trapper       = require("ui/trapper")
+local ImageViewer   = require("ui/widget/imageviewer")
+local RenderImage   = require("ui/renderimage")
+
 local ZhihuClient  = require("zhihu_client")
 local ArticleViewer = require("article_viewer")
 
 local DEFAULT_FONT_SIZE = 22
+local QR_POLL_INTERVAL = 3
+local QR_MAX_POLLS = 40
 
 -- CSS for ScrollHtmlWidget article rendering
 local ARTICLE_CSS = [[
@@ -34,12 +41,24 @@ body {
     line-height: 1.8;
     color: #000;
     margin: 0;
-    padding: 0px;
+    padding: 0;
 }
 a {
     color: #000;
-    font-weight: bold;
     text-decoration: none;
+}
+.img-placeholder {
+    display: block;
+    width: 33%;
+    height: 180px;
+    border: 2px solid #000;
+    text-align: center;
+    line-height: 180px;
+    margin: 10px auto;
+}
+.img-num {
+    font-size: 1.5em;
+    font-weight: bold;
 }
 .close-link {
     float: right;
@@ -47,24 +66,39 @@ a {
 }
 
 .title {
-    font-weight: bold;
     text-align: left;
     border-bottom: 2px solid #000;
-    padding-bottom: 10px;
-    margin-bottom: 15px;
+    padding-bottom: 5px;
+    margin-bottom: 8px;
+    margin-top: 0;
+}
+h1.title {
+    font-size: 1.6em;
+    font-weight: bold;
+}
+.author {
+    font-style: italic;
+    margin-bottom: 2px;
+}
+h2.author {
+    font-size: 1.3em;
+    font-weight: bold;
 }
 .answer {
-    margin-bottom: 25px;
-    padding-bottom: 15px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
     border-bottom: 1px dashed #888;
+    margin-top: 0;
 }
 .author {
     font-weight: bold;
-    margin-bottom: 3px;
+    font-style: italic;
+    margin-bottom: 2px;
 }
 .voteup {
     color: #666;
-    margin-bottom: 10px;
+    margin-bottom: 6px;
+    font-style: italic;
 }
 p {
     text-indent: 0.5em;
@@ -75,8 +109,7 @@ img {
     max-width: 100%;
     height: auto;
     display: block;
-    margin: 10px 0;
-    border: 1px solid #666;
+    margin: 0;
 }
 blockquote {
     border-left: 3px solid #888;
@@ -117,6 +150,7 @@ function Zhihu:init()
     self.pending_token = nil
     self.client = ZhihuClient:new()
     self.client:init(DataStorage:getSettingsDir())
+    self.qr_image_path = DataStorage:getDataDir() .. "/cache/zhihu_qrcode.png"
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
@@ -235,7 +269,7 @@ function Zhihu:buildMenuItems()
         text = _("About"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v81\n\n- QR code login\n- Recommended feed with refresh\n- ArticleViewer with boundary close\n- Mixed text and images (图文混排)\n- Export to HTML"),
+                text = _("Zhihu Reader v89\n\n- QR code login\n- Recommended feed with refresh\n- ArticleViewer with boundary close\n- Mixed text and images (图文混排)\n- Export to HTML"),
                 timeout = 5,
             })
         end,
@@ -254,7 +288,7 @@ function Zhihu:startQrLogin()
         return
     end
 
-    -- v35: Generate token but do NOT start polling
+    -- Generate token
     local token = self.client:generateQrToken()
     if not token then
         UIManager:show(InfoMessage:new{text = _("Failed to generate QR code."), timeout = 3})
@@ -262,69 +296,34 @@ function Zhihu:startQrLogin()
     end
     self.pending_token = token
 
-    -- v35: Try ImageViewer first, then fallback to TextViewer URL
+    -- Try synchronous download + ArticleViewer with ScrollHtmlWidget
     local qr_url = self.client:getQrImageUrl(token)
     if qr_url then
-        local iv_ok, ImageViewer = pcall(require, "ui/widget/imageviewer")
-        local ri_ok, RenderImage = pcall(require, "ui/renderimage")
-        local dm_ok, DownloadManager = pcall(require, "ui/downloadmgr")
+        local qr_dir = DataStorage:getDataDir() .. "/zhihu_qr/"
+        os.execute("mkdir -p '" .. qr_dir .. "'")
+        local qr_path = qr_dir .. "qr.png"
+        local download_ok = pcall(function()
+            self.client:_downloadImage(qr_url, qr_path)
+        end)
 
-        if iv_ok and ri_ok then
-            local qr_path = DataStorage:getDataDir() .. "/zhihu_qr.png"
-            local downloaded = false
+        if download_ok then
+            -- Build HTML to display QR via ScrollHtmlWidget
+            local qr_html = "<div style='text-align:center;'><img src='qr.png' style='max-width:80%;'/></div>"
+                .. "<p style='text-align:center; font-size:1.2em; margin-top:20px;'>" .. _("Scan with Zhihu App") .. "</p>"
+                .. "<p style='text-align:center; font-size:0.9em; color:#555;'>" .. _("Swipe up/down or press Back to close") .. "</p>"
 
-            if dm_ok and DownloadManager then
-                downloaded = pcall(function()
-                    DownloadManager:new{
-                        url = qr_url,
-                        download_path = qr_path,
-                        onSuccess = function()
-                            local img_ok, image = pcall(function()
-                                return RenderImage:renderImageFile(qr_path)
-                            end)
-                            if img_ok and image then
-                                local viewer_ok, viewer = pcall(function()
-                                    return ImageViewer:new{
-                                        image = image,
-                                        title = _("Scan with Zhihu App"),
-                                        fullscreen = true,
-                                        with_title_bar = true,
-                                    }
-                                end)
-                                if viewer_ok and viewer then
-                                    UIManager:show(viewer)
-                                    return true
-                                end
-                            end
-                        end,
-                    }:startDownload()
-                end)
-            end
+            local show_ok = pcall(function()
+                local viewer = ArticleViewer:new{
+                    html_content = qr_html,
+                    css = "body { text-align: center; padding: 20px; }",
+                    image_dir = qr_dir,
+                    font_size = 22,
+                }
+                UIManager:show(viewer)
+            end)
 
-            if not downloaded then
-                -- Direct download fallback
-                downloaded = pcall(function()
-                    self.client:_downloadImage(qr_url, qr_path)
-                end)
-                if downloaded then
-                    local img_ok, image = pcall(function()
-                        return RenderImage:renderImageFile(qr_path)
-                    end)
-                    if img_ok and image then
-                        local viewer_ok, viewer = pcall(function()
-                            return ImageViewer:new{
-                                image = image,
-                                title = _("Scan with Zhihu App"),
-                                fullscreen = true,
-                                with_title_bar = true,
-                            }
-                        end)
-                        if viewer_ok and viewer then
-                            UIManager:show(viewer)
-                            return
-                        end
-                    end
-                end
+            if show_ok then
+                return
             end
         end
     end
@@ -544,10 +543,15 @@ function Zhihu:showArticle(question_id, title, item_type)
         image_list = {},
     }
 
-    -- Handle images: download to local dir (if enabled) or strip from HTML
-    local image_dir = nil
+    local font_size = self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)
+
+    -- Build async image loading data
+    local pending_images = nil
+    local temp_dir = nil
+    local full_html = html_content
+    
     if show_images then
-        local temp_dir = DataStorage:getDataDir() .. "/zhihu_article_images/"
+        temp_dir = DataStorage:getDataDir() .. "/zhihu_article_images/"
         os.execute("mkdir -p '" .. temp_dir .. "'")
 
         -- Extract image URLs from HTML
@@ -560,54 +564,45 @@ function Zhihu:showArticle(question_id, title, item_type)
             end
         end)
 
-        -- Store URLs for backward-compatible View Images menu
         self.current_article.image_list = img_urls
 
         if #img_urls > 0 then
-            local url_to_file = {}
-            for i, url in ipairs(img_urls) do
-                local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
-                if ext == "webp" then ext = "jpg" end -- fallback for unsupported formats
-                local filename = string.format("img_%03d.%s", i, ext)
-                local filepath = temp_dir .. filename
-
-                local ok = pcall(function()
-                    self.client:_downloadImage(url, filepath)
-                end)
-
-                if ok then
-                    url_to_file[url] = filename
-                end
-            end
-
-            -- Replace remote URLs with local filenames in HTML
-            for url, filename in pairs(url_to_file) do
-                -- Escape pattern-special characters in URL
-                local esc_url = url:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
-                html_content = html_content:gsub(
-                    'src="' .. esc_url .. '"',
-                    'src="' .. filename .. '"'
-                )
-            end
-
-            if next(url_to_file) then
-                image_dir = temp_dir
-            end
+            -- Replace remote img URLs with numbered placeholders for text-only display
+            local placeholder_index = 0
+            local text_html = html_content:gsub('<img[^>]-src="([^"]*)"', function(url)
+                placeholder_index = placeholder_index + 1
+                return '<div class="img-placeholder"><span class="img-num">[图片' .. placeholder_index .. ']</span></div>'
+            end)
+            html_content = text_html
+            pending_images = img_urls
         end
     else
-        -- show_images is off: replace img tags with placeholder text
-        html_content = html_content:gsub('<img[^>]*/>', '[图片]')
+        -- show_images is off: replace img tags with styled placeholder boxes
+        local img_index = 0
+        local img_urls = {}
+        html_content = html_content:gsub('<img([^>]*)>', function(attrs)
+            img_index = img_index + 1
+            local url = attrs:match('src="([^"]*)"') or attrs:match("src='([^']*)")
+            if url and url ~= "" then
+                table.insert(img_urls, url)
+            end
+            return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
+        end)
+        self.current_article.image_list = img_urls
     end
-
-    local font_size = self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)
 
     -- Try ArticleViewer first, fallback to TextViewer if it crashes
     local ok_viewer = pcall(function()
         UIManager:show(ArticleViewer:new{
             html_content = html_content,
             css = ARTICLE_CSS,
-            image_dir = image_dir,
+            image_dir = nil,  -- text-only initially
             font_size = font_size,
+            -- Async image loading fields
+            full_html = full_html,
+            pending_images = pending_images,
+            temp_dir = temp_dir,
+            plugin = self,
         })
     end)
 
@@ -653,8 +648,8 @@ function Zhihu:showImages()
     local menu = Menu:new{
         title = _("Article Images"),
         item_table = image_items,
-        width = 800,
-        height = 900,
+        covers_fullscreen = true,
+        is_borderless = true,
     }
 
     function menu:onMenuSelect(entry)
@@ -675,8 +670,9 @@ function Zhihu:showImage(url)
     local loading = InfoMessage:new{text = _("Loading image..."), timeout = 0}
     UIManager:show(loading)
 
-    -- Download image to temp file
-    local img_path = DataStorage:getDataDir() .. "/zhihu_image.jpg"
+    -- Use URL-based unique filename so multiple images don't overwrite each other
+    local safe_url = url:gsub("[^%w]", "_")
+    local img_path = DataStorage:getDataDir() .. "/zhihu_img_" .. safe_url:sub(1, 80) .. ".jpg"
     local ok = pcall(function()
         self.client:_downloadImage(url, img_path)
     end)

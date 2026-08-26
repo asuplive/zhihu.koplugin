@@ -805,7 +805,7 @@ end
 function ZhihuClient:_getAnswersViaApi(question_id, title, show_images)
     -- v35: add include=content to get answer body
     local url = "https://www.zhihu.com/api/v4/questions/" .. question_id
-        .. "/answers?limit=5&offset=0&include=data[*].content"
+        .. "/answers?limit=5&offset=0&include=data[*].content,voteup_count,created_time,author"
 
     local qurl = "https://www.zhihu.com/question/" .. question_id
     local body, code = self:_request(url, "GET", qurl)
@@ -1050,7 +1050,7 @@ function ZhihuClient:_formatAnswersHtml(answers, title)
 
     local parts = {}
     if title then
-        table.insert(parts, '<div class="title">' .. escapeXml(title) .. '</div>')
+        table.insert(parts, '<h1 class="title">' .. escapeXml(title) .. '</h1>')
     end
 
     for i, answer in ipairs(answers) do
@@ -1068,7 +1068,7 @@ function ZhihuClient:_formatAnswersHtml(answers, title)
         end
 
         table.insert(parts, string.format(
-            '<div class="answer"><p class="author">%s</p><p class="voteup">%s</p>%s</div>',
+            '<div class="answer"><h2 class="author">%s</h2><p class="voteup">%s</p>%s</div>',
             escapeXml(author), meta_line, content
         ))
     end
@@ -1093,7 +1093,7 @@ function ZhihuClient:getAnswersHtml(question_id, title, item_type)
 
     -- Strategy 1: Answers API
     local url = "https://www.zhihu.com/api/v4/questions/" .. question_id
-        .. "/answers?limit=5&offset=0&include=data[*].content"
+        .. "/answers?limit=5&offset=0&include=data[*].content,voteup_count,created_time,author"
     local qurl = "https://www.zhihu.com/question/" .. question_id
     local body, code = self:_request(url, "GET", qurl)
 
