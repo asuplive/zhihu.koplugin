@@ -1,5 +1,5 @@
 --[[
-    Zhihu Reader Plugin for KOReader v89
+    Zhihu Reader Plugin for KOReader v125
     - QR code login: ImageViewer with QR image
     - Recommended feed with refresh button
     - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
@@ -21,6 +21,7 @@ local _               = require("gettext")
 local T               = require("ffi/util").template
 local Device          = require("device")
 local Screen          = Device.screen
+local logger          = require("logger")
 
 -- QR login: Trapper + ImageViewer (v7 proven stable on Android)
 local Trapper       = require("ui/trapper")
@@ -36,7 +37,7 @@ local QR_MAX_POLLS = 40
 
 -- CSS for ScrollHtmlWidget article rendering
 local ARTICLE_CSS = [[
-body {
+html, body {
     font-family: "Noto Serif CJK SC", "WenQuanYi Micro Hei", serif;
     line-height: 1.8;
     color: #000;
@@ -217,10 +218,8 @@ function Zhihu:buildMenuItems()
         })
     end
 
-    table.insert(sub_items, {text = "", separator = true})
-
     table.insert(sub_items, {
-        text = _("Font Size"),
+        text = "Font Size",
         sub_item_table = {
             {text = _("Small (18)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 18 end,
              callback = function() self.settings:saveSetting("font_size", 18) self.updated = true end},
@@ -258,6 +257,11 @@ function Zhihu:buildMenuItems()
     })
 
     table.insert(sub_items, {
+        text = _("Clear Image Cache"),
+        callback = function() self:clearCache() end,
+    })
+
+    table.insert(sub_items, {
         text = _("Export HTML"),
         enabled_func = function()
             return self.current_article ~= nil
@@ -266,10 +270,18 @@ function Zhihu:buildMenuItems()
     })
 
     table.insert(sub_items, {
+        text = _("Export EPUB"),
+        enabled_func = function()
+            return self.current_article ~= nil
+        end,
+        callback = function() self:exportEpub() end,
+    })
+
+    table.insert(sub_items, {
         text = _("About"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v89\n\n- QR code login\n- Recommended feed with refresh\n- ArticleViewer with boundary close\n- Mixed text and images (图文混排)\n- Export to HTML"),
+                text = _("Zhihu Reader v125\n\n- QR code login\n- Recommended feed with refresh\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
                 timeout = 5,
             })
         end,
@@ -545,14 +557,17 @@ function Zhihu:showArticle(question_id, title, item_type)
 
     local font_size = self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)
 
-    -- Build async image loading data
-    local pending_images = nil
-    local temp_dir = nil
+    -- Handle images: download to local dir (if enabled) or strip from HTML
+    -- v124: Per-article cache with single-pass replacement.
+    -- Each <img> is either replaced with local path (cached) or placeholder (pending).
+    local image_dir = nil
+    local pending_urls = nil
     local full_html = html_content
-    
+    local article_dir = nil
     if show_images then
-        temp_dir = DataStorage:getDataDir() .. "/zhihu_article_images/"
-        os.execute("mkdir -p '" .. temp_dir .. "'")
+        -- Create article-specific cache directory
+        article_dir = DataStorage:getDataDir() .. "/zhihu_article_images/" .. question_id .. "/"
+        os.execute("mkdir -p '" .. article_dir .. "'")
 
         -- Extract image URLs from HTML
         local img_urls = {}
@@ -567,17 +582,40 @@ function Zhihu:showArticle(question_id, title, item_type)
         self.current_article.image_list = img_urls
 
         if #img_urls > 0 then
-            -- Replace remote img URLs with numbered placeholders for text-only display
-            local placeholder_index = 0
-            local text_html = html_content:gsub('<img[^>]-src="([^"]*)"', function(url)
-                placeholder_index = placeholder_index + 1
-                return '<div class="img-placeholder"><span class="img-num">[图片' .. placeholder_index .. ']</span></div>'
+            pending_urls = {}
+            local cached_count = 0
+            local img_index = 0
+
+            -- Single-pass: replace each <img> with either local file or placeholder
+            html_content = html_content:gsub('<img([^>]*)>', function(attrs)
+                img_index = img_index + 1
+                local url = attrs:match('src="([^"]*)"') or attrs:match("src='([^']*)")
+                if not url or url == "" then
+                    return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
+                end
+
+                local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
+                if ext == "webp" then ext = "jpg" end
+                local filename = string.format("img_%03d.%s", img_index, ext)
+                local filepath = article_dir .. filename
+
+                -- Check cache
+                local f = io.open(filepath, "rb")
+                if f then
+                    f:close()
+                    cached_count = cached_count + 1
+                    return '<img src="' .. filename .. '" alt=""/>'
+                else
+                    table.insert(pending_urls, {url = url, index = img_index})
+                    return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
+                end
             end)
-            html_content = text_html
-            pending_images = img_urls
+
+            if cached_count > 0 then
+                image_dir = article_dir
+            end
         end
     else
-        -- show_images is off: replace img tags with styled placeholder boxes
         local img_index = 0
         local img_urls = {}
         html_content = html_content:gsub('<img([^>]*)>', function(attrs)
@@ -596,12 +634,12 @@ function Zhihu:showArticle(question_id, title, item_type)
         UIManager:show(ArticleViewer:new{
             html_content = html_content,
             css = ARTICLE_CSS,
-            image_dir = nil,  -- text-only initially
+            image_dir = image_dir,
             font_size = font_size,
-            -- Async image loading fields
+            -- v122: Pass cache info for background download
             full_html = full_html,
-            pending_images = pending_images,
-            temp_dir = temp_dir,
+            pending_urls = pending_urls,
+            article_dir = article_dir,
             plugin = self,
         })
     end)
@@ -719,6 +757,26 @@ function Zhihu:showImage(url)
 end
 
 -- =========================================================================
+-- Clear Image Cache
+-- =========================================================================
+
+function Zhihu:clearCache()
+    local cache_dir = DataStorage:getDataDir() .. "/zhihu_article_images/"
+    local ok = os.execute("rm -rf '" .. cache_dir .. "'")
+    if ok then
+        UIManager:show(InfoMessage:new{
+            text = _("Image cache cleared."),
+            timeout = 2,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = _("Failed to clear cache."),
+            timeout = 2,
+        })
+    end
+end
+
+-- =========================================================================
 -- Export article as HTML with local images
 -- =========================================================================
 
@@ -753,11 +811,10 @@ function Zhihu:exportHtml()
     local title = article.title or "Zhihu Article"
     local timestamp = os.time()
     
-    -- Generate safe filename: remove ALL non-alphanumeric chars except basic ASCII
-    local safe_title = title:gsub("[^%w%s%-]", "_")
+    local safe_title = title:gsub("[\\/:*?\"<>|]", "_")
     safe_title = safe_title:gsub("^%s+", ""):gsub("%s+$", "")
     safe_title = safe_title:gsub("%s+", "_")
-    if #safe_title > 30 then safe_title = safe_title:sub(1, 30) end
+    if #safe_title > 50 then safe_title = safe_title:sub(1, 50) end
     if safe_title == "" then safe_title = "zhihu" end
     
     -- Fallback filename using question_id if title-based fails
@@ -951,6 +1008,148 @@ function Zhihu:exportHtml()
         pcall(function()
             ReaderUI:showReader(html_path)
         end)
+    end
+end
+
+-- =========================================================================
+-- Export article as EPUB
+-- =========================================================================
+
+function Zhihu:exportEpub()
+    if not self.current_article then
+        UIManager:show(InfoMessage:new{text = _("No article to export."), timeout = 3})
+        return
+    end
+
+    local article = self.current_article
+    local loading = InfoMessage:new{text = _("Fetching article..."), timeout = 0}
+    UIManager:show(loading)
+
+    local html_content = self.client:getAnswersHtml(
+        article.question_id,
+        article.title,
+        article.item_type
+    )
+
+    UIManager:close(loading)
+
+    if not html_content or html_content == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Failed to fetch article content."),
+            timeout = 5,
+        })
+        return
+    end
+
+    -- Step 2: Prepare safe filename
+    local title = article.title or "Zhihu Article"
+    local timestamp = os.time()
+    
+    local safe_title = title:gsub("[\\/:*?\"<>|%c]", "_")
+    safe_title = safe_title:gsub("^%s+", ""):gsub("%s+$", "")
+    safe_title = safe_title:gsub("%s+", "_")
+    if #safe_title > 50 then safe_title = safe_title:sub(1, 50) end
+    if safe_title == "" then safe_title = "zhihu" end
+    
+    local export_dir = DataStorage:getDataDir() .. "/zhihu_exports"
+    local epub_name = safe_title .. "_" .. timestamp .. ".epub"
+    local epub_path = export_dir .. "/" .. epub_name
+
+    -- Ensure export directory exists
+    os.execute("mkdir -p '" .. export_dir .. "'")
+
+    -- Step 3: Download all images to a temp directory
+    local article_dir = export_dir .. "/epub_temp_" .. timestamp
+    local images_dir = article_dir .. "/images"
+    os.execute("mkdir -p '" .. images_dir .. "'")
+
+    -- Extract image URLs
+    local img_urls = {}
+    local seen = {}
+    html_content:gsub('<img[^>]-src="([^"]*)"', function(url)
+        if url and url ~= "" and not seen[url] then
+            seen[url] = true
+            table.insert(img_urls, url)
+        end
+    end)
+
+    -- Download images
+    local url_to_file = {}
+    for i, url in ipairs(img_urls) do
+        local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
+        if ext == "webp" then ext = "jpg" end
+        local filename = string.format("img_%03d.%s", i, ext)
+        local filepath = images_dir .. "/" .. filename
+
+        local dl_ok, dl_result = pcall(function()
+            return self.client:_downloadImage(url, filepath)
+        end)
+        if dl_ok and dl_result then
+            -- Verify file exists
+            local f = io.open(filepath, "rb")
+            if f then
+                f:close()
+                url_to_file[url] = filepath
+            end
+        end
+    end
+
+    -- Replace img src with absolute paths for EpubBuilder
+    for url, filepath in pairs(url_to_file) do
+        local esc_url = url:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
+        html_content = html_content:gsub(
+            'src="' .. esc_url .. '"',
+            'src="' .. filepath .. '"'
+        )
+    end
+
+    -- Step 4: Build EPUB using epub_builder
+    local ok_builder, EpubBuilder = pcall(require, "epub_builder")
+    if not ok_builder then
+        UIManager:show(InfoMessage:new{
+            text = _("EPUB builder not available."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local book = {
+        title = title,
+        identifier = "zhihu-" .. (article.question_id or "article") .. "-" .. timestamp,
+        date = os.date("!%Y-%m-%d"),
+        chapters = {
+            {
+                title = title,
+                meta = "",
+                body = html_content,
+            },
+        },
+    }
+
+    local ok, result = pcall(function()
+        return EpubBuilder.build(book, epub_path)
+    end)
+
+    -- Cleanup temp directory
+    os.execute("rm -rf '" .. article_dir .. "'")
+
+    if ok and result then
+        UIManager:show(InfoMessage:new{
+            text = T(_("EPUB exported to:\n%1"), epub_path),
+            timeout = 3,
+        })
+        -- Auto-open in KOReader
+        local ok_reader, ReaderUI = pcall(require, "apps/reader/readerui")
+        if ok_reader and ReaderUI then
+            pcall(function()
+                ReaderUI:showReader(epub_path)
+            end)
+        end
+    else
+        UIManager:show(InfoMessage:new{
+            text = T(_("EPUB export failed: %1"), tostring(result)),
+            timeout = 5,
+        })
     end
 end
 
