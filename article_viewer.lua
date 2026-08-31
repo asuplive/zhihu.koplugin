@@ -26,6 +26,7 @@ local ArticleViewer = InputContainer:extend{
     pending_urls = nil,    -- List of {url=url, index=i} to download
     article_dir = nil,     -- Per-article cache directory
     plugin = nil,          -- Reference to main Zhihu plugin
+    image_map = nil,       -- url -> cached local filename (so cached imgs survive refresh)
     _closed = false,
     _downloading = false,
 }
@@ -137,17 +138,19 @@ function ArticleViewer:onShow()
                 self._downloading = false
                 if downloaded_count > 0 then
                     local new_html = full_html
+                    local function replaceUrl(u, fn)
+                        local esc = u:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
+                        new_html = new_html:gsub('src="' .. esc .. '"', 'src="' .. fn .. '"')
+                    end
+                    -- Keep already-cached images (they reference remote URLs in full_html)
+                    if self.image_map then
+                        for u, fn in pairs(self.image_map) do replaceUrl(u, fn) end
+                    end
+                    -- Then swap in freshly downloaded pending images
                     for _, item in ipairs(self.pending_urls) do
-                        local url = item.url
-                        local idx = item.index
-                        local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
-                        if ext == "webp" then ext = "jpg" end
-                        local filename = string.format("img_%03d.%s", idx, ext)
-                        local esc_url = url:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
-                        new_html = new_html:gsub(
-                            'src="' .. esc_url .. '"',
-                            'src="' .. filename .. '"'
-                        )
+                        if url_to_file[item.url] then
+                            replaceUrl(item.url, url_to_file[item.url])
+                        end
                     end
 
                     -- In-place refresh: keep same widget, update content
@@ -167,7 +170,6 @@ function ArticleViewer:onShow()
             local url = item.url
             local idx = item.index
             local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
-            if ext == "webp" then ext = "jpg" end
             local filename = string.format("img_%03d.%s", idx, ext)
             local filepath = article_dir .. filename
 

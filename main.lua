@@ -31,6 +31,11 @@ local RenderImage   = require("ui/renderimage")
 local ZhihuClient  = require("zhihu_client")
 local ArticleViewer = require("article_viewer")
 
+-- Safely quote a path for os.execute (prevents breakage/injection on quotes & spaces)
+local function shellQuote(p)
+    return "'" .. tostring(p):gsub("'", "'\\''") .. "'"
+end
+
 local DEFAULT_FONT_SIZE = 22
 local QR_POLL_INTERVAL = 3
 local QR_MAX_POLLS = 40
@@ -149,6 +154,10 @@ function Zhihu:init()
     self.updated = false
     self.cached_user_name = nil
     self.pending_token = nil
+    self._qr_viewer = nil
+    self._menu_widget = nil
+    self._login_poll_timer = nil
+    self._login_poll_token = nil
     self.client = ZhihuClient:new()
     self.client:init(DataStorage:getSettingsDir())
     self.qr_image_path = DataStorage:getDataDir() .. "/cache/zhihu_qrcode.png"
@@ -183,7 +192,6 @@ end
 function Zhihu:buildMenuItems()
     local sub_items = {}
     local logged_in = self.client:isLoggedIn()
-    local pending = self.pending_token ~= nil
 
     if logged_in then
         local user_name = self.cached_user_name
@@ -201,15 +209,6 @@ function Zhihu:buildMenuItems()
         table.insert(sub_items, {
             text = _("Logout"),
             callback = function() self:doLogout() end,
-        })
-    elseif pending then
-        table.insert(sub_items, {
-            text = _("Complete Login"),
-            callback = function() self:completeQrLogin() end,
-        })
-        table.insert(sub_items, {
-            text = _("Cancel Login"),
-            callback = function() self:cancelQrLogin() end,
         })
     else
         table.insert(sub_items, {
@@ -300,19 +299,24 @@ function Zhihu:startQrLogin()
         return
     end
 
+    -- Stop any previous (stale) polling session before starting a new one.
+    self:_stopLoginPoll()
+
     -- Generate token
-    local token = self.client:generateQrToken()
+    local token = self.client:getQrCodeToken()
     if not token then
         UIManager:show(InfoMessage:new{text = _("Failed to generate QR code."), timeout = 3})
         return
     end
-    self.pending_token = token
 
-    -- Try synchronous download + ArticleViewer with ScrollHtmlWidget
-    local qr_url = self.client:getQrImageUrl(token)
+    -- Capture the currently open menu (the Zhihu submenu) so we can refresh it after login.
+    self._menu_widget = (UIManager.getTopWidget and pcall(UIManager.getTopWidget) and UIManager:getTopWidget())
+        or (UIManager._running_widgets and UIManager._running_widgets[#UIManager._running_widgets])
+
+    local qr_url = self.client:getQrCodeImageUrl(self.client:getScanUrl(token))
     if qr_url then
         local qr_dir = DataStorage:getDataDir() .. "/zhihu_qr/"
-        os.execute("mkdir -p '" .. qr_dir .. "'")
+        os.execute("mkdir -p " .. shellQuote(qr_dir))
         local qr_path = qr_dir .. "qr.png"
         local download_ok = pcall(function()
             self.client:_downloadImage(qr_url, qr_path)
@@ -322,7 +326,7 @@ function Zhihu:startQrLogin()
             -- Build HTML to display QR via ScrollHtmlWidget
             local qr_html = "<div style='text-align:center;'><img src='qr.png' style='max-width:80%;'/></div>"
                 .. "<p style='text-align:center; font-size:1.2em; margin-top:20px;'>" .. _("Scan with Zhihu App") .. "</p>"
-                .. "<p style='text-align:center; font-size:0.9em; color:#555;'>" .. _("Swipe up/down or press Back to close") .. "</p>"
+                .. "<p style='text-align:center; font-size:0.9em; color:#555;'>" .. _("Login completes automatically once confirmed") .. "</p>"
 
             local show_ok = pcall(function()
                 local viewer = ArticleViewer:new{
@@ -331,16 +335,19 @@ function Zhihu:startQrLogin()
                     image_dir = qr_dir,
                     font_size = 22,
                 }
+                self._qr_viewer = viewer
                 UIManager:show(viewer)
             end)
 
             if show_ok then
+                -- Begin auto-polling: detect scan/confirm and finish login on its own.
+                self:_startLoginPoll(token)
                 return
             end
         end
     end
 
-    -- Fallback: show URL text in TextViewer
+    -- Fallback: show URL text in TextViewer (auto-polling still runs in the background)
     local scan_url = self.client:getScanUrl(token)
     UIManager:show(TextViewer:new{
         title = _("Login with Zhihu App"),
@@ -350,61 +357,73 @@ function Zhihu:startQrLogin()
             .. scan_url
             .. "\n\n"
             .. _("4. Confirm login on your phone\n")
-            .. _("5. Close this and tap 'Complete Login' in menu"),
+            .. _("Login completes automatically once confirmed"),
         text_face = Font:getFace("cfont", 20),
         justified = false,
     })
+    self:_startLoginPoll(token)
 end
 
-function Zhihu:completeQrLogin()
-    if not self.pending_token then
-        UIManager:show(InfoMessage:new{text = _("No pending login."), timeout = 3})
-        return
+-- Poll the QR scan status in the background and finish login automatically.
+function Zhihu:_startLoginPoll(token)
+    self:_stopLoginPoll()
+    self._login_poll_token = token
+    local plugin = self
+    local function poll()
+        if plugin._login_poll_token ~= token then return end
+        local ok, status = pcall(function() return plugin.client:checkScanStatus(token) end)
+        if not ok then
+            -- Transient network error: retry shortly.
+            plugin._login_poll_timer = UIManager:scheduleIn(3, poll)
+            return
+        end
+        if status == "confirmed" then
+            plugin:_finishLogin(token)
+        elseif status == "expired" then
+            plugin:_stopLoginPoll()
+            UIManager:show(InfoMessage:new{text = _("QR code expired. Please try again."), timeout = 3})
+        else
+            -- "waiting" or "scanned": keep polling.
+            plugin._login_poll_timer = UIManager:scheduleIn(2.5, poll)
+        end
     end
-
-    -- v33: Remove loading widget, avoid widget lifecycle crash on Android
-    local ok, status = pcall(function()
-        return self.client:checkScanStatus(self.pending_token)
-    end)
-
-    if not ok then
-        UIManager:show(InfoMessage:new{
-            text = T(_("Login check failed: %1"), tostring(status)),
-            timeout = 5,
-        })
-        return
-    end
-
-    if status == "confirmed" then
-        self.client:saveCookies()
-        self.pending_token = nil
-        self.cached_user_name = self.client:getUserName()
-        UIManager:show(InfoMessage:new{text = _("Login successful!"), timeout = 5})
-    elseif status == "expired" then
-        self.pending_token = nil
-        UIManager:show(InfoMessage:new{text = _("QR expired. Try again."), timeout = 3})
-    elseif status == "scanned" then
-        UIManager:show(InfoMessage:new{
-            text = _("Scanned but not confirmed.\nPlease confirm on phone."),
-            timeout = 4,
-        })
-    else
-        UIManager:show(InfoMessage:new{
-            text = _("Not confirmed yet.\nPlease confirm on phone and try again."),
-            timeout = 4,
-        })
-    end
+    self._login_poll_timer = UIManager:scheduleIn(1.5, poll)
 end
 
-function Zhihu:cancelQrLogin()
+function Zhihu:_stopLoginPoll()
+    if self._login_poll_timer then
+        pcall(function() UIManager:unschedule(self._login_poll_timer) end)
+        self._login_poll_timer = nil
+    end
+    self._login_poll_token = nil
+end
+
+function Zhihu:_finishLogin(token)
+    self:_stopLoginPoll()
+    self.client:saveCookies()
     self.pending_token = nil
-    UIManager:show(InfoMessage:new{text = _("Login cancelled."), timeout = 2})
+    self.cached_user_name = self.client:getUserName()
+    -- Close the QR viewer if it is still on screen.
+    if self._qr_viewer then
+        pcall(function() UIManager:close(self._qr_viewer) end)
+        self._qr_viewer = nil
+    end
+    -- Refresh the open Zhihu submenu so it shows the logged-in items.
+    local w = self._menu_widget
+    if w and w.updateItems then
+        pcall(function() w:updateItems() end)
+    end
+    self.updated = true
+    UIManager:show(InfoMessage:new{text = _("Login successful!"), timeout = 3})
 end
 
 function Zhihu:doLogout()
+    self:_stopLoginPoll()
     self.client:logout()
     self.pending_token = nil
     self.cached_user_name = nil
+    self._qr_viewer = nil
+    self._menu_widget = nil
     UIManager:show(InfoMessage:new{text = _("Logged out."), timeout = 2})
 end
 
@@ -417,38 +436,29 @@ function Zhihu:showRecommendFeed()
         UIManager:show(InfoMessage:new{text = _("Device is offline."), timeout = 3})
         return
     end
-    self:_loadRecommendFeed(0)
+    self:_loadRecommendFeed(nil)
 end
 
-function Zhihu:_loadRecommendFeed(offset)
-    offset = offset or 0
-
-    if not self.client:isLoggedIn() then
-        UIManager:show(InfoMessage:new{text = _("Please login first."), timeout = 3})
-        return
-    end
-
-    local loading = InfoMessage:new{text = _("Loading..."), timeout = 0}
-    UIManager:show(loading)
-
-    local items, err = self.client:getRecommendFeed(offset)
-    UIManager:close(loading)
-
-    if not items then
-        local diag = tostring(err or "unknown")
-        local last_err = self.client:getLastError() or ""
-        if last_err ~= "" then diag = diag .. "\n(" .. last_err .. ")" end
-        UIManager:show(InfoMessage:new{text = T(_("Load failed: %1"), diag), timeout = 8})
-        return
-    end
-
+-- Shared feed list renderer (used by the Recommended Feed).
+-- 'show_more' adds the "Load More" cursor button (recommend only; hot is a fixed snapshot).
+function Zhihu:_loadFeedMenu(items, title, show_more)
     local menu_items = {}
     for _, item in ipairs(items) do
         local text = item.title or "No Title"
         if item.author and item.author ~= "" then
             text = text .. "\n  -- " .. item.author
         end
-        -- Show image link on second line if available
+        -- Hot-feed heat / ranking hint
+        if item.hot_text and item.hot_text ~= "" then
+            text = text .. "\n  " .. item.hot_text
+        end
+        -- Excerpt snippet (hot feed carries one)
+        if item.excerpt and item.excerpt ~= "" then
+            local ex = item.excerpt
+            if #ex > 60 then ex = ex:sub(1, 57) .. "..." end
+            text = text .. "\n  " .. ex
+        end
+        -- Image hint if available
         if item.images and #item.images > 0 then
             local img_url = item.images[1]
             if #img_url > 60 then
@@ -468,14 +478,17 @@ function Zhihu:_loadRecommendFeed(offset)
         })
     end
 
-    -- Add refresh button at the bottom
-    table.insert(menu_items, {
-        text = _(">>> Refresh >>>"),
-        callback = function() end,  -- Dummy callback, handled in onMenuSelect
-    })
+    -- "Load more" button for cursor-based feeds (recommend); hot feed is a fixed snapshot
+    if show_more then
+        table.insert(menu_items, {
+            text = _(">>> Load More >>>"),
+            is_refresh = true,
+            callback = function() end,  -- Dummy callback, handled in onMenuSelect
+        })
+    end
 
     local menu = Menu:new{
-        title = _("Recommended Feed"),
+        title = title,
         item_table = menu_items,
         covers_fullscreen = true,
         is_borderless = true,
@@ -483,9 +496,13 @@ function Zhihu:_loadRecommendFeed(offset)
 
     local plugin = self
     function menu:onMenuSelect(entry)
-        if entry.text == _(">>> Refresh >>>") then
+        if entry.is_refresh then
             UIManager:close(menu)
-            plugin:_loadRecommendFeed(offset + 20)
+            if plugin.feed_next_url then
+                plugin:_loadRecommendFeed(plugin.feed_next_url)
+            else
+                UIManager:show(InfoMessage:new{text = _("No more items."), timeout = 2})
+            end
             return
         end
 
@@ -503,6 +520,40 @@ function Zhihu:_loadRecommendFeed(offset)
     end
 
     UIManager:show(menu)
+end
+
+function Zhihu:showRecommendFeed()
+    if NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+        UIManager:show(InfoMessage:new{text = _("Device is offline."), timeout = 3})
+        return
+    end
+    self:_loadRecommendFeed(nil)
+end
+
+function Zhihu:_loadRecommendFeed(start_url)
+    if not self.client:isLoggedIn() then
+        UIManager:show(InfoMessage:new{text = _("Please login first."), timeout = 3})
+        return
+    end
+
+    local loading = InfoMessage:new{text = _("Loading..."), timeout = 0}
+    UIManager:show(loading)
+
+    -- Fetch up to 3 pages and accumulate, so the list fills more than one screen.
+    local items, next_url = self.client:getRecommendFeed(start_url, 3)
+    UIManager:close(loading)
+
+    if not items then
+        local diag = tostring(next_url or "unknown")
+        local last_err = self.client:getLastError() or ""
+        if last_err ~= "" then diag = diag .. "\n(" .. last_err .. ")" end
+        UIManager:show(InfoMessage:new{text = T(_("Load failed: %1"), diag), timeout = 8})
+        return
+    end
+
+    -- Remember the cursor so "Load More" loads the next batch instead of re-fetching the top.
+    self.feed_next_url = next_url
+    self:_loadFeedMenu(items, _("Recommended Feed"), true)
 end
 
 -- =========================================================================
@@ -567,7 +618,7 @@ function Zhihu:showArticle(question_id, title, item_type)
     if show_images then
         -- Create article-specific cache directory
         article_dir = DataStorage:getDataDir() .. "/zhihu_article_images/" .. question_id .. "/"
-        os.execute("mkdir -p '" .. article_dir .. "'")
+        os.execute("mkdir -p " .. shellQuote(article_dir))
 
         -- Extract image URLs from HTML
         local img_urls = {}
@@ -584,6 +635,7 @@ function Zhihu:showArticle(question_id, title, item_type)
         if #img_urls > 0 then
             pending_urls = {}
             local cached_count = 0
+            local cached_map = {}
             local img_index = 0
 
             -- Single-pass: replace each <img> with either local file or placeholder
@@ -595,7 +647,6 @@ function Zhihu:showArticle(question_id, title, item_type)
                 end
 
                 local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
-                if ext == "webp" then ext = "jpg" end
                 local filename = string.format("img_%03d.%s", img_index, ext)
                 local filepath = article_dir .. filename
 
@@ -604,6 +655,7 @@ function Zhihu:showArticle(question_id, title, item_type)
                 if f then
                     f:close()
                     cached_count = cached_count + 1
+                    cached_map[url] = filename
                     return '<img src="' .. filename .. '" alt=""/>'
                 else
                     table.insert(pending_urls, {url = url, index = img_index})
@@ -639,6 +691,7 @@ function Zhihu:showArticle(question_id, title, item_type)
             -- v122: Pass cache info for background download
             full_html = full_html,
             pending_urls = pending_urls,
+            image_map = cached_map,
             article_dir = article_dir,
             plugin = self,
         })
@@ -762,7 +815,7 @@ end
 
 function Zhihu:clearCache()
     local cache_dir = DataStorage:getDataDir() .. "/zhihu_article_images/"
-    local ok = os.execute("rm -rf '" .. cache_dir .. "'")
+    local ok = os.execute("rm -rf " .. shellQuote(cache_dir))
     if ok then
         UIManager:show(InfoMessage:new{
             text = _("Image cache cleared."),
@@ -825,19 +878,28 @@ function Zhihu:exportHtml()
     local images_dir = article_dir .. "/images"
 
     -- Try to create directory
-    local mkdir_ok = os.execute("mkdir -p " .. images_dir)
+    local mkdir_ok = os.execute("mkdir -p " .. shellQuote(images_dir))
     if not mkdir_ok then
         -- Fallback: try without spaces/special chars in path
         article_dir = export_dir .. "/" .. fallback_name
         images_dir = article_dir .. "/images"
-        os.execute("mkdir -p " .. images_dir)
+        os.execute("mkdir -p " .. shellQuote(images_dir))
     end
 
-    -- Step 3: Download images with progress and inline as base64
-    local images = article.image_list or {}
-    local total_images = #images
+    -- Step 3: Collect <img> source URLs from the exported HTML, then inline them as base64.
+    -- NOTE: we map by URL (not by positional index) so images stay correct even when the
+    -- freshly re-fetched HTML differs in order from the reading-time image list.
+    local img_urls = {}
+    local seen = {}
+    html_content:gsub('<img[^>]-src="([^"]*)"', function(url)
+        if url and url ~= "" and not seen[url] then
+            seen[url] = true
+            table.insert(img_urls, url)
+        end
+    end)
+    local total_images = #img_urls
     local downloaded_count = 0
-    local img_base64_map = {} -- index -> {name, base64, mime} mapping
+    local url_base64 = {} -- url -> "data:..." string
 
     -- Helper: read file as binary string
     local function readBinaryFile(path)
@@ -865,89 +927,46 @@ function Zhihu:exportHtml()
         return table.concat(out)
     end
 
-    if total_images > 0 then
-        for i, url in ipairs(images) do
-            -- Show progress
-            UIManager:show(InfoMessage:new{
-                text = T(_("Downloading images (%1/%2)..."), i, total_images),
-                timeout = 0,
-            })
+    local function downloadAndEncode(url)
+        local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
+        local tmp_path = export_dir .. "/_tmp_img_" .. timestamp .. "_" .. math.random(100000, 999999)
+        local ok = pcall(function()
+            self.client:_downloadImage(url, tmp_path)
+        end)
+        if not ok then return nil end
+        local data = readBinaryFile(tmp_path)
+        pcall(function() os.remove(tmp_path) end)
+        if not data or #data == 0 then return nil end
+        local mime = (ext == "png") and "image/png" or (ext == "gif") and "image/gif" or "image/jpeg"
+        return "data:" .. mime .. ";base64," .. base64Encode(data)
+    end
 
-            local ext = url:match("%.(%w+)$") or "jpg"
-            local img_name = string.format("img_%03d.%s", i, ext)
-            local img_path = images_dir .. "/" .. img_name
-            local tmp_path = export_dir .. "/_tmp_img_" .. timestamp .. "_" .. i
-
-            local ok = pcall(function()
-                self.client:_downloadImage(url, tmp_path)
-            end)
-
-            if ok then
-                -- Move temp file to images dir (keep for file manager viewing)
-                os.execute("mv " .. tmp_path .. " " .. img_path)
-                downloaded_count = downloaded_count + 1
-
-                -- Read image and encode to base64 for inline embedding
-                local img_data = readBinaryFile(img_path)
-                if img_data and #img_data > 0 then
-                    local mime_type = (ext == "png") and "image/png" or "image/jpeg"
-                    local b64 = base64Encode(img_data)
-                    img_base64_map[i] = {
-                        mime = mime_type,
-                        data = b64,
-                    }
-                end
-            end
+    for i, url in ipairs(img_urls) do
+        UIManager:show(InfoMessage:new{
+            text = T(_("Downloading images (%1/%2)..."), i, total_images),
+            timeout = 0,
+        })
+        local data_url = downloadAndEncode(url)
+        if data_url then
+            url_base64[url] = data_url
+            downloaded_count = downloaded_count + 1
         end
     end
 
-    -- Step 4: Replace each <img> src with inline base64 data URL
-    local img_idx = 0
-    local new_html_parts = {}
-    local last_pos = 1
-    local html_len = #html_content
-
-    while true do
-        -- Find <img tag start
-        local img_start = html_content:find("<img", last_pos, true)
-        if not img_start then break end
-
-        -- Find end of img tag (next >)
-        local img_end = html_content:find(">", img_start)
-        if not img_end then break end
-
-        -- Copy everything before this img tag
-        table.insert(new_html_parts, html_content:sub(last_pos, img_start - 1))
-
-        -- Extract the img tag
-        local img_tag = html_content:sub(img_start, img_end)
-        img_idx = img_idx + 1
-
-        -- Replace src with base64 data URL
-        local img_info = img_base64_map[img_idx]
-        if img_info and img_info.data then
-            local data_url = 'src="data:' .. img_info.mime .. ';base64,' .. img_info.data .. '"'
-            local new_tag = img_tag:gsub('src="[^"]*"', data_url, 1)
-            table.insert(new_html_parts, new_tag)
-        else
-            -- No downloaded image for this slot, keep original or use placeholder
-            table.insert(new_html_parts, img_tag)
+    -- Step 4: Replace each <img src="url"> with its inline base64 data URL (matched by URL)
+    html_content = html_content:gsub('(<img[^>]-)src="([^"]*)"', function(prefix, url)
+        local data_url = url_base64[url]
+        if data_url then
+            return prefix .. 'src="' .. data_url .. '"'
         end
-        last_pos = img_end + 1
-    end
-
-    -- Append remaining content after last img tag
-    if last_pos <= html_len then
-        table.insert(new_html_parts, html_content:sub(last_pos))
-    end
-
-    html_content = table.concat(new_html_parts)
+        return prefix .. 'src="' .. url .. '"'
+    end)
 
     -- Step 5: Generate full HTML document with large e-ink friendly fonts
     local full_html = '<html>\n'
         .. '<head>\n'
         .. '<meta charset="UTF-8">\n'
-        .. '<title>' .. title .. '</title>\n'
+        .. '<title>' .. title:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;") .. '</title>\n'
         .. '<style type="text/css">\n'
         .. '*{margin:0;padding:0;}\n'
         .. 'body{font-family:serif;line-height:2.2;font-size:36px;color:#000;}\n'
@@ -979,7 +998,7 @@ function Zhihu:exportHtml()
     -- Retry with fallback path if first attempt fails
     if not f then
         article_dir = export_dir .. "/" .. fallback_name
-        os.execute("mkdir -p " .. article_dir)
+        os.execute("mkdir -p " .. shellQuote(article_dir))
         html_path = article_dir .. "/index.html"
         f = io.open(html_path, "w")
     end
@@ -1056,12 +1075,12 @@ function Zhihu:exportEpub()
     local epub_path = export_dir .. "/" .. epub_name
 
     -- Ensure export directory exists
-    os.execute("mkdir -p '" .. export_dir .. "'")
+    os.execute("mkdir -p " .. shellQuote(export_dir))
 
     -- Step 3: Download all images to a temp directory
     local article_dir = export_dir .. "/epub_temp_" .. timestamp
     local images_dir = article_dir .. "/images"
-    os.execute("mkdir -p '" .. images_dir .. "'")
+    os.execute("mkdir -p " .. shellQuote(images_dir))
 
     -- Extract image URLs
     local img_urls = {}
@@ -1077,7 +1096,6 @@ function Zhihu:exportEpub()
     local url_to_file = {}
     for i, url in ipairs(img_urls) do
         local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
-        if ext == "webp" then ext = "jpg" end
         local filename = string.format("img_%03d.%s", i, ext)
         local filepath = images_dir .. "/" .. filename
 
@@ -1131,7 +1149,7 @@ function Zhihu:exportEpub()
     end)
 
     -- Cleanup temp directory
-    os.execute("rm -rf '" .. article_dir .. "'")
+    os.execute("rm -rf " .. shellQuote(article_dir))
 
     if ok and result then
         UIManager:show(InfoMessage:new{

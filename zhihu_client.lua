@@ -536,169 +536,141 @@ function ZhihuClient:getScanUrl(token)
         or ("https://www.zhihu.com/account/scan/login/" .. (token or ""))
 end
 
+function ZhihuClient:_applyCookieString(str)
+    -- Apply a raw "name=value; name2=value2" cookie string (e.g. from JSON "cookie" field)
+    if not str or str == "" then return end
+    for seg in str:gmatch("([^;]+)") do
+        local s = seg:gsub("^%s+", ""):gsub("%s+$", "")
+        local eq = s:find("=", 1, true)
+        if eq then
+            local name = s:sub(1, eq - 1)
+            local value = s:sub(eq + 1)
+            local lname = name:lower()
+            if lname ~= "path" and lname ~= "domain" and lname ~= "expires"
+               and lname ~= "max-age" and lname ~= "secure" and lname ~= "httponly"
+               and lname ~= "samesite" and lname ~= "version" then
+                self.cookie_jar.cookies[name] = value
+            end
+        end
+    end
+end
+
 function ZhihuClient:checkScanStatus(token)
     local url = "https://www.zhihu.com/api/v3/account/api/login/qrcode/" .. token .. "/scan_info"
     local body, code, headers = self:_request(url, "GET", "https://www.zhihu.com/signin")
-    
-    -- v33: z_c0 cookie is the definitive login indicator
+
+    -- z_c0 cookie is the definitive login indicator (may arrive via set-cookie header)
     if self.cookie_jar:get("z_c0") then return "confirmed" end
-    
-    -- Check JSON status from body
+
     if body then
         local ok, data = pcall(decodeJSON, body)
         if ok and data and data.status ~= nil then
-            if data.status == 0 then return "waiting" end
-            if data.status == 1 then return "scanned" end
-            if data.status == 2 then return "confirmed" end
-            if data.status == 3 then return "expired" end
+            local status = data.status
+            -- On confirm, Zhihu often sends the auth cookies inside the JSON "cookie" field.
+            if (status == 2 or status == "confirmed") and data.cookie then
+                self:_applyCookieString(tostring(data.cookie))
+            end
+            if self.cookie_jar:get("z_c0") then return "confirmed" end
+            if status == 0 then return "waiting" end
+            if status == 1 then return "scanned" end
+            if status == 2 then return "confirmed" end
+            if status == 3 then return "expired" end
         end
     end
-    
+
     if code == 404 or code == 410 then return "expired" end
     return "waiting"
-end
-
--- =========================================================================
--- Hot List
--- =========================================================================
-
-function ZhihuClient:getHotList()
-    if not self.cookie_jar:get("d_c0") then
-        self:getInitialCookies()
-    end
-
-    local url = "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=50&desktop=true"
-    local body, code = self:_request(url, "GET", "https://www.zhihu.com/hot")
-
-    if not body then
-        self.last_error = "API: " .. (code or "request failed")
-        return nil
-    end
-    if code ~= 200 then
-        self.last_error = "API HTTP " .. tostring(code)
-        return nil
-    end
-
-    local data = decodeJSON(body)
-    if not data then return nil, "JSON parse failed" end
-
-    local items = {}
-    if data.data and type(data.data) == "table" then
-        for _, item in ipairs(data.data) do
-            local target = item.target or {}
-            local question_id = nil
-            local item_type = "answer"
-
-            -- Primary: extract from URL
-            if target.url then
-                question_id = target.url:match("question/(%d+)")
-                if not question_id then
-                    question_id = target.url:match("p/(%d+)")
-                    if question_id then item_type = "article" end
-                end
-            end
-
-            -- Secondary: for answer type, get question.id
-            if not question_id then
-                local ttype = (target.type or ""):lower()
-                if ttype:match("answer") then
-                    if target.question and target.question.id then
-                        question_id = target.question.id
-                    end
-                elseif ttype:match("article") or ttype:match("column") then
-                    item_type = "article"
-                    question_id = target.id
-                elseif ttype:match("question") then
-                    question_id = target.id
-                end
-            end
-
-            -- Skip unsupported
-            local ttype_lower = (target.type or ""):lower()
-            if ttype_lower:match("roundtable") or ttype_lower:match("video")
-               or ttype_lower:match("live") or ttype_lower:match("idea") then
-                question_id = nil
-            end
-
-            if question_id and question_id ~= "0" then
-                table.insert(items, {
-                    index       = #items + 1,
-                    title       = target.title or "No Title",
-                    excerpt     = target.excerpt or "",
-                    question_id = tostring(question_id),
-                    item_type   = item_type,
-                    hot_text    = item.detail_text or "",
-                })
-            end
-        end
-    end
-
-    if #items == 0 then return nil, "No valid items" end
-    return items
 end
 
 -- =========================================================================
 -- Recommend Feed
 -- =========================================================================
 
-function ZhihuClient:getRecommendFeed()
+function ZhihuClient:getRecommendFeed(start_url, max_pages)
+    max_pages = max_pages or 3
     if not self:isLoggedIn() then return nil, "Not logged in" end
 
-    -- Try v3 first
-    local url = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=20&desktop=true"
-    local body, code = self:_request(url, "GET", "https://www.zhihu.com/")
-    if not body or code ~= 200 then
-        -- Fallback to v4
-        url = "https://www.zhihu.com/api/v4/feed/topstory/recommend?limit=20&desktop=true"
-        body, code = self:_request(url, "GET", "https://www.zhihu.com/")
+    local base_url = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=20&desktop=true"
+    local url = start_url or base_url
+
+    local all_items = {}
+    local seen = {}
+    local next_url = nil
+
+    for page = 1, max_pages do
+        local body, code = self:_request(url, "GET", "https://www.zhihu.com/")
+        if not body or code ~= 200 then
+            self.last_error = "API HTTP " .. tostring(code or "failed")
+            break
+        end
+
+        local data = decodeJSON(body)
+        if not data or not data.data then break end
+
+        for _, item in ipairs(data.data) do
+            local target = item.target or {}
+            local ttype = (target.type or ""):lower()
+
+            -- Resolve id + type for all openable card kinds
+            local question_id, item_type
+            if ttype:match("answer") then
+                item_type = "answer"
+                if target.question and target.question.id then
+                    question_id = target.question.id
+                elseif target.url then
+                    question_id = target.url:match("question/(%d+)")
+                end
+            elseif ttype:match("article") or ttype:match("column") then
+                item_type = "article"
+                question_id = target.id or (target.url and target.url:match("p/(%d+)"))
+            elseif ttype:match("question") then
+                item_type = "answer"
+                question_id = target.id
+            else
+                -- Unknown card: best-effort from URL
+                question_id = target.url and (target.url:match("question/(%d+)")
+                    or target.url:match("p/(%d+)"))
+            end
+
+            local title = (target.question and target.question.title) or target.title or ""
+
+            -- Drop cards we cannot open (video / promotion / live / roundtable / idea)
+            local skip = ttype == ""
+                or ttype:match("video") or ttype:match("promotion")
+                or ttype:match("roundtable") or ttype:match("live")
+                or ttype:match("idea") or ttype:match("zvideo")
+
+            if not skip and title ~= "" and question_id and question_id ~= "" then
+                local key = item_type .. ":" .. question_id
+                if not seen[key] then
+                    seen[key] = true
+                    local author = (target.author and target.author.name) or ""
+                    table.insert(all_items, {
+                        index       = #all_items + 1,
+                        title       = title,
+                        item_type   = item_type,
+                        question_id = tostring(question_id),
+                        author      = author,
+                        content     = "",
+                        voteup      = target.voteup_count or 0,
+                        images      = {},
+                    })
+                end
+            end
+        end
+
+        -- Follow cursor pagination (zhihu returns paging.next + paging.is_end)
+        if data.paging and data.paging.next and not data.paging.is_end then
+            next_url = data.paging.next
+            url = data.paging.next
+        else
+            next_url = nil
+            break
+        end
     end
 
-    if not body or code ~= 200 then
-        self.last_error = "API HTTP " .. tostring(code or "failed")
-        return nil
-    end
-
-    local data = decodeJSON(body)
-    if not data or not data.data then return nil, "No data" end
-
-    local items = {}
-    for _, item in ipairs(data.data) do
-        local target = item.target or {}
-        local question_id = nil
-        if target.question and target.question.id then
-            question_id = target.question.id
-        elseif target.url then
-            question_id = target.url:match("question/(%d+)")
-        end
-        local title = ""
-        if target.question and target.question.title then
-            title = target.question.title
-        elseif target.title then
-            title = target.title
-        end
-        local author = ""
-        if target.author and target.author.name then
-            author = target.author.name
-        end
-        local content, images = htmlToText(target.content or "", true)
-        local voteup = target.voteup_count or 0
-
-        if title ~= "" or question_id then
-            table.insert(items, {
-                index       = #items + 1,
-                title       = title ~= "" and title or "No Title",
-                type        = "answer",
-                question_id = question_id and tostring(question_id) or "",
-                author      = author,
-                content     = content,
-                voteup      = voteup,
-                images      = images or {},
-            })
-        end
-    end
-
-    if #items == 0 then return nil, "No items" end
-    return items
+    if #all_items == 0 then return nil, "No items" end
+    return all_items, next_url
 end
 
 -- =========================================================================

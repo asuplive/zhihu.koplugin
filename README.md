@@ -1,4 +1,4 @@
-# Zhihu Reader for KOReader v125
+# Zhihu Reader for KOReader v126
 
 在 KOReader 中浏览知乎推荐流，支持二维码登录和整页翻页阅读。
 
@@ -54,6 +54,18 @@ zhihu.koplugin/
 ```
 
 ## 更新日志
+
+### v126 (代码评审修复)
+- **修复扫码登录崩溃**：`main.lua` 误调用了不存在的 `generateQrToken()` / `getQrImageUrl()`，已改为正确的 `getQrCodeToken()` / `getQrCodeImageUrl()`
+- **铺满一页：推荐流多页累积 + 游标翻页**：原 `getRecommendFeed` 只抓单页且推荐流类型解析过严，列表往往只有几条。现改为跟随知乎返回的 `paging.next` 游标连抓最多 3 页并去重累积，同时正确识别文章/专栏/问题类卡片、过滤视频/广告/直播等不可打开项；菜单「Load More」按游标加载下一批而非重复抓顶部
+- **修复推荐流 item_type 错误**：推荐项来自 `target.type`，之前被硬编码为 `answer`，文章类内容现在能正确识别
+- **修复阅读器后台刷新后已缓存图片丢失**：新增 `image_map`，刷新时保留已缓存图片的本地引用
+- **修复 webp 图片被错误改名成 .jpg**：删除强制 `webp→jpg` 改名，保留真实扩展名
+- **修复导出 HTML 图片错位**：改为按 URL 匹配 base64 内联（而非按位置序号），并转义 `<title>`
+- **修复含单引号的标题导致 `mkdir` 失败**：`os.execute` 改为统一走 `shellQuote` 安全引用
+- **重做扫码登录为「点击→出码→自动登录」**：移除手动「Complete Login」按钮。根因是 `checkScanStatus` 只认 `set-cookie` 头里的 `z_c0`，而知乎扫码确认后登录 cookie 通常经由 `scan_info` 响应 JSON 的 `cookie` 字段下发，导致始终拿不到登录态。现已在确认时解析并写入该字段；并在出码后自动轮询扫码状态（每 2.5s），确认即保存 cookie、关闭二维码、原地刷新菜单为已登录态（Recommended Feed / Logout / User）
+- **删除 Hot Feed（知乎热点）**：应需求移除了 `getHotList()`、`showHotFeed` / `_loadHotFeed` 及相关菜单项
+- **删除冗余备份文件**：移除了 `article_viewer_v111.lua`、`article_viewer_v115.lua`、`main.lua_epub_export.lua`
 
 ### v125
 - EPUB 导出后自动打开
