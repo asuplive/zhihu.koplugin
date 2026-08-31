@@ -1,11 +1,11 @@
-# Zhihu Reader for KOReader v126
+# Zhihu Reader for KOReader v127
 
 在 KOReader 中浏览知乎推荐流，支持二维码登录和整页翻页阅读。
 
 ## 功能
 
-- 二维码扫码登录知乎账号
-- 查看个性化推荐流（需登录）
+- 二维码扫码登录知乎账号（扫码确认后自动完成登录）
+- 查看个性化推荐流（需登录，每批 12 条，可 Load More 加载更多）
 - 基于 ScrollHtmlWidget 的图文混排阅读器
 - 字体大小调节（Small/Medium/Large/Extra Large）
 - 导出 HTML（base64 内联图片，自动打开）
@@ -30,7 +30,7 @@
 3. 确认登录后，菜单点击 Complete Login
 
 ### 浏览推荐
-登录后菜单出现 Recommended Feed，点击加载内容列表。列表底部有 >>> Refresh >>> 按钮加载更多。
+登录后菜单出现 Recommended Feed，点击加载内容列表，每批显示 12 条。列表底部有 >>> Load More >>> 按钮按游标加载下一批。
 
 ### 阅读文章
 点击列表项进入 ArticleViewer：
@@ -54,6 +54,20 @@ zhihu.koplugin/
 ```
 
 ## 更新日志
+
+### v127
+- **推荐流列表改为每批 12 条**：`getRecommendFeed` 增加累积上限（12 条）并在满批后截断；「Load More」游标在计数判断之前就已推进，始终从真实的下一页继续
+- **修复 `image_map` 作用域 bug**：v126 的「刷新后保留已缓存图片」修复实际从未生效——`cached_map` 声明在 `if` 块内部，传给 ArticleViewer 的 `image_map` 引用的是未定义的全局变量（恒为 nil）。已提升为函数级局部变量
+- **修复纯文本残留 `>` 字符**：`htmlToText` 的 `<[^>]+` 模式只匹配到 `>` 之前，标签结尾的 `>` 会残留在输出中，改为 `<[^>]*>`
+- **修复二维码下载失败仍进入扫码界面**：原来 `pcall` 成功即认为下载成功，未校验返回值与文件是否落盘；现在两项都检查
+- **修复 UTF-8 截断乱码**：列表摘要与加载提示按字节截断会把汉字切成半个产生乱码，新增 `utf8Truncate` 按多字节边界截断
+- **修复图片查看器把 webp/png 强改名为 .jpg**：保留 URL 中的真实扩展名
+- **登出时清空推荐流游标**（`feed_next_url`），换账号后 Load More 不再复用旧游标
+- **删除重复定义的 `showRecommendFeed`**：两处完全相同的定义，后者静默覆盖前者
+- **删除失效占位函数 `getAltQrImageUrl`**：返回不可用的占位 URL 且从未被调用
+- **gsub 替换串改用函数形式**：URL/文件路径含 `%` 时不再被当作模式替换符（EPUB 导出与阅读器后台刷新两处）
+- 阅读器文本模式回退的标签剥离模式 `<[^>]-[>]-` 修正为 `<[^>]*>`
+- 版本号、About 信息与文档同步更新为 v127
 
 ### v126 (代码评审修复)
 - **修复扫码登录崩溃**：`main.lua` 误调用了不存在的 `generateQrToken()` / `getQrImageUrl()`，已改为正确的 `getQrCodeToken()` / `getQrCodeImageUrl()`

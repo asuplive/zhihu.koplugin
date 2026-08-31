@@ -91,7 +91,9 @@ local function htmlToText(html, keep_images)
     html = html:gsub("<hr[^>]*/?>", "\n" .. SEPARATOR .. "\n")
     html = html:gsub("</td>", "  ")
     html = html:gsub("</th>", "  ")
-    html = html:gsub("<[^>]+", "")
+    -- v127 fix: include the closing ">" (old pattern "<[^>]+" left stray ">"
+    -- characters in the plain text output)
+    html = html:gsub("<[^>]*>", "")
     html = html:gsub("&nbsp;", " ")
     html = html:gsub("&lt;", "<")
     html = html:gsub("&gt;", ">")
@@ -509,16 +511,6 @@ function ZhihuClient:getQrCodeImageUrl(scan_url)
     return "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" .. encoded
 end
 
-function ZhihuClient:getAltQrImageUrl(scan_url)
-    -- Fallback QR API
-    local login_url = scan_url
-        or ("https://www.zhihu.com/account/scan/login/" .. (self._qr_token or ""))
-    local encoded = login_url:gsub("([^%w%-%.%_%~ ])", function(c)
-        return string.format("%%%02X", string.byte(c))
-    end):gsub(" ", "+")
-    return "https://api.qrcode-monkey.com/tmp/" .. encoded -- placeholder, try goqr.me
-end
-
 function ZhihuClient:downloadQrImage(token, filepath)
     -- Try Zhihu's own QR image endpoint first
     local zhihu_url = "https://www.zhihu.com/api/v3/account/api/login/qrcode/" .. token .. "/image"
@@ -588,6 +580,8 @@ end
 
 function ZhihuClient:getRecommendFeed(start_url, max_pages)
     max_pages = max_pages or 3
+    -- v127: the Recommended Feed list shows 12 items per batch
+    local max_items = 12
     if not self:isLoggedIn() then return nil, "Not logged in" end
 
     local base_url = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=20&desktop=true"
@@ -659,7 +653,10 @@ function ZhihuClient:getRecommendFeed(start_url, max_pages)
             end
         end
 
-        -- Follow cursor pagination (zhihu returns paging.next + paging.is_end)
+        -- Follow cursor pagination (zhihu returns paging.next + paging.is_end).
+        -- The cursor is always advanced BEFORE the item-count check, so
+        -- "Load More" continues from the true next page even when we stop
+        -- early after reaching the 12-item cap.
         if data.paging and data.paging.next and not data.paging.is_end then
             next_url = data.paging.next
             url = data.paging.next
@@ -667,6 +664,14 @@ function ZhihuClient:getRecommendFeed(start_url, max_pages)
             next_url = nil
             break
         end
+
+        -- v127: stop accumulating once the batch is full
+        if #all_items >= max_items then break end
+    end
+
+    -- v127: trim the batch to exactly the list size
+    for i = #all_items, max_items + 1, -1 do
+        all_items[i] = nil
     end
 
     if #all_items == 0 then return nil, "No items" end

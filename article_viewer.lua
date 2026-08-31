@@ -140,7 +140,10 @@ function ArticleViewer:onShow()
                     local new_html = full_html
                     local function replaceUrl(u, fn)
                         local esc = u:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
-                        new_html = new_html:gsub('src="' .. esc .. '"', 'src="' .. fn .. '"')
+                        -- v127 fix: function replacement so "%" in the filename
+                        -- is not treated as a magic character by gsub
+                        new_html = new_html:gsub('src="' .. esc .. '"',
+                            function() return 'src="' .. fn .. '"' end)
                     end
                     -- Keep already-cached images (they reference remote URLs in full_html)
                     if self.image_map then

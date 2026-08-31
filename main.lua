@@ -1,11 +1,10 @@
 --[[
-    Zhihu Reader Plugin for KOReader v125
-    - QR code login: ImageViewer with QR image
-    - Recommended feed with refresh button
+    Zhihu Reader Plugin for KOReader v127
+    - QR code login: auto-completing poll login
+    - Recommended feed (12 items per batch) with Load More cursor
     - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
-    - Close button (X icon) in article viewer top-right (Tap handler fix)
     - Mixed text and image display (图文混排)
-    - Export to HTML with images
+    - Export to HTML & EPUB with auto-open
 ]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -34,6 +33,23 @@ local ArticleViewer = require("article_viewer")
 -- Safely quote a path for os.execute (prevents breakage/injection on quotes & spaces)
 local function shellQuote(p)
     return "'" .. tostring(p):gsub("'", "'\\''") .. "'"
+end
+
+-- v127: Truncate a string to max_len bytes without splitting a UTF-8 character
+-- (avoids mojibake when cutting Chinese text in list entries / loading titles)
+local function utf8Truncate(s, max_len)
+    if not s or #s <= max_len then return s end
+    local cut = max_len
+    -- Step back over UTF-8 continuation bytes (10xxxxxx) to a character boundary
+    while cut > 1 do
+        local b = s:byte(cut)
+        if b and b >= 0x80 and b < 0xC0 then
+            cut = cut - 1
+        else
+            break
+        end
+    end
+    return s:sub(1, cut)
 end
 
 local DEFAULT_FONT_SIZE = 22
@@ -280,7 +296,7 @@ function Zhihu:buildMenuItems()
         text = _("About"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v125\n\n- QR code login\n- Recommended feed with refresh\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
+                text = _("Zhihu Reader v127\n\n- QR code login (auto-complete)\n- Recommended feed: 12 items per batch\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
                 timeout = 5,
             })
         end,
@@ -318,9 +334,16 @@ function Zhihu:startQrLogin()
         local qr_dir = DataStorage:getDataDir() .. "/zhihu_qr/"
         os.execute("mkdir -p " .. shellQuote(qr_dir))
         local qr_path = qr_dir .. "qr.png"
-        local download_ok = pcall(function()
-            self.client:_downloadImage(qr_url, qr_path)
+        -- v127 fix: check the actual download result and file existence,
+        -- not just whether the call was reached without a Lua error.
+        local dl_ok, dl_result = pcall(function()
+            return self.client:_downloadImage(qr_url, qr_path)
         end)
+        local download_ok = (dl_ok and dl_result == true)
+        if download_ok then
+            local f = io.open(qr_path, "rb")
+            if f then f:close() else download_ok = false end
+        end
 
         if download_ok then
             -- Build HTML to display QR via ScrollHtmlWidget
@@ -424,6 +447,9 @@ function Zhihu:doLogout()
     self.cached_user_name = nil
     self._qr_viewer = nil
     self._menu_widget = nil
+    -- v127 fix: drop the recommend-feed cursor so a new account
+    -- does not "Load More" from the previous account's position
+    self.feed_next_url = nil
     UIManager:show(InfoMessage:new{text = _("Logged out."), timeout = 2})
 end
 
@@ -455,7 +481,8 @@ function Zhihu:_loadFeedMenu(items, title, show_more)
         -- Excerpt snippet (hot feed carries one)
         if item.excerpt and item.excerpt ~= "" then
             local ex = item.excerpt
-            if #ex > 60 then ex = ex:sub(1, 57) .. "..." end
+            -- v127: cut on a UTF-8 boundary instead of raw bytes
+            if #ex > 60 then ex = utf8Truncate(ex, 57) .. "..." end
             text = text .. "\n  " .. ex
         end
         -- Image hint if available
@@ -522,14 +549,6 @@ function Zhihu:_loadFeedMenu(items, title, show_more)
     UIManager:show(menu)
 end
 
-function Zhihu:showRecommendFeed()
-    if NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
-        UIManager:show(InfoMessage:new{text = _("Device is offline."), timeout = 3})
-        return
-    end
-    self:_loadRecommendFeed(nil)
-end
-
 function Zhihu:_loadRecommendFeed(start_url)
     if not self.client:isLoggedIn() then
         UIManager:show(InfoMessage:new{text = _("Please login first."), timeout = 3})
@@ -539,7 +558,8 @@ function Zhihu:_loadRecommendFeed(start_url)
     local loading = InfoMessage:new{text = _("Loading..."), timeout = 0}
     UIManager:show(loading)
 
-    -- Fetch up to 3 pages and accumulate, so the list fills more than one screen.
+    -- v127: fetch up to 3 pages behind the scenes, but the list is capped
+    -- at 12 items (client-side limit); "Load More" continues from the cursor.
     local items, next_url = self.client:getRecommendFeed(start_url, 3)
     UIManager:close(loading)
 
@@ -568,8 +588,11 @@ function Zhihu:showArticle(question_id, title, item_type)
 
     local show_images = self.settings:readSetting("show_images", false)
 
+    -- v127: cut on a UTF-8 boundary instead of raw bytes
+    local display_title = title or ""
+    if #display_title > 30 then display_title = utf8Truncate(display_title, 29) .. "..." end
     local loading = InfoMessage:new{
-        text = T(_("Loading: %1"), title and #title > 30 and title:sub(1, 30) .. "..." or (title or "")),
+        text = T(_("Loading: %1"), display_title),
         timeout = 0,
     }
     UIManager:show(loading)
@@ -613,6 +636,11 @@ function Zhihu:showArticle(question_id, title, item_type)
     -- Each <img> is either replaced with local path (cached) or placeholder (pending).
     local image_dir = nil
     local pending_urls = nil
+    -- v127 fix: hoisted to function scope so it is actually passed to ArticleViewer.
+    -- (Previously declared inside the `if` block, so `image_map = cached_map` below
+    -- read an undefined global and the v126 "keep cached images on refresh" fix
+    -- never took effect.)
+    local cached_map = {}
     local full_html = html_content
     local article_dir = nil
     if show_images then
@@ -635,7 +663,6 @@ function Zhihu:showArticle(question_id, title, item_type)
         if #img_urls > 0 then
             pending_urls = {}
             local cached_count = 0
-            local cached_map = {}
             local img_index = 0
 
             -- Single-pass: replace each <img> with either local file or placeholder
@@ -703,7 +730,7 @@ function Zhihu:showArticle(question_id, title, item_type)
             text = _("Article viewer unavailable, using text mode."),
             timeout = 2,
         })
-        local plain_text = html_content:gsub("<[^>]-[>]-", ""):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
+        local plain_text = html_content:gsub("<[^>]*>", ""):gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
         UIManager:show(TextViewer:new{
             title = title or "",
             text = plain_text,
@@ -763,7 +790,10 @@ function Zhihu:showImage(url)
 
     -- Use URL-based unique filename so multiple images don't overwrite each other
     local safe_url = url:gsub("[^%w]", "_")
-    local img_path = DataStorage:getDataDir() .. "/zhihu_img_" .. safe_url:sub(1, 80) .. ".jpg"
+    -- v127 fix: keep the real extension instead of forcing .jpg
+    -- (webp/png/gif images were being renamed to .jpg)
+    local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
+    local img_path = DataStorage:getDataDir() .. "/zhihu_img_" .. safe_url:sub(1, 80) .. "." .. ext
     local ok = pcall(function()
         self.client:_downloadImage(url, img_path)
     end)
@@ -1115,9 +1145,11 @@ function Zhihu:exportEpub()
     -- Replace img src with absolute paths for EpubBuilder
     for url, filepath in pairs(url_to_file) do
         local esc_url = url:gsub("([%%%.%-%+%[%]%(%)%*%?%^%$])", "%%%1")
+        -- v127 fix: function replacement so "%" in paths is not treated
+        -- as a magic character by gsub
         html_content = html_content:gsub(
             'src="' .. esc_url .. '"',
-            'src="' .. filepath .. '"'
+            function() return 'src="' .. filepath .. '"' end
         )
     end
 
