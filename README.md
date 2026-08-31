@@ -1,10 +1,11 @@
-# Zhihu Reader for KOReader v127
+# Zhihu Reader for KOReader v128
 
 在 KOReader 中浏览知乎推荐流，支持二维码登录和整页翻页阅读。
 
 ## 功能
 
 - 二维码扫码登录知乎账号（扫码确认后自动完成登录）
+- 知乎风控（人机验证）检测与浏览器验证流程，修复安卓扫码"无反应"
 - 查看个性化推荐流（需登录，每批 12 条，可 Load More 加载更多）
 - 基于 ScrollHtmlWidget 的图文混排阅读器
 - 字体大小调节（Small/Medium/Large/Extra Large）
@@ -26,8 +27,26 @@
 
 ### 登录
 1. 菜单中选择 Login with QR Code
-2. 手机知乎 App 扫描二维码或输入 URL
-3. 确认登录后，菜单点击 Complete Login
+2. 手机知乎 App 扫描二维码
+3. 手机上确认登录，插件自动轮询并完成登录
+
+### 安卓风控（人机验证）
+部分网络环境（常见于手机流量、运营商 NAT 出口 IP）会被知乎风控拦截：扫码状态接口返回
+HTTP 403 / 错误码 40352，并要求跳转 `zhihu.com/account/unhuman` 做滑块人机验证。旧版本会把
+这种响应当作"等待中"无限轮询，表现为**扫码后没反应**。
+
+v128 起的处理流程：
+1. 检测到风控后自动停止轮询，弹出「Zhihu Verification Needed」菜单
+2. 选择 **Open Verification in Browser**：调起系统浏览器打开验证页（安卓支持），完成滑块验证
+   - 不支持调起浏览器的设备可选择 **Show Verification URL** 手动打开该链接
+3. 验证完成后回到 KOReader，选择 **I Have Verified - Continue Login** 继续轮询，登录自动完成
+4. 若仍被拦截，可选 **Restart Login (Fresh Cookies)**：丢弃被标记的 `d_c0` 设备标识、
+   重新获取 cookie 并生成新二维码
+
+> 说明：验证页是 JavaScript 滑块验证码，KOReader 的 HTML 渲染器无法运行 JS，因此无法在
+> 插件内直接显示验证界面，需要借助系统/外部浏览器完成。验证会话与本客户端的 cookie 绑定，
+> 在同一网络下于浏览器完成验证后，KOReader 的后续请求即可恢复。Kindle 等未被风控的设备
+> 不受影响。
 
 ### 浏览推荐
 登录后菜单出现 Recommended Feed，点击加载内容列表，每批显示 12 条。列表底部有 >>> Load More >>> 按钮按游标加载下一批。
@@ -54,6 +73,17 @@ zhihu.koplugin/
 ```
 
 ## 更新日志
+
+### v128
+- **修复安卓扫码登录"无反应"**：根因是知乎风控——移动网络下 `scan_info` 接口返回 HTTP 403 / 错误码 40352（"网络环境存在异常，需要人机验证"），响应中没有 `status` 字段，旧代码将其当作 `"waiting"` 无限轮询，扫码确认后毫无反馈。现在识别为独立状态并进入验证流程
+- **新增风控验证流程**：检测到风控后停止轮询并弹出「Zhihu Verification Needed」菜单：
+  - `Open Verification in Browser`：通过 `Device:openLink` 调起系统浏览器打开 `account/unhuman` 验证页（安卓可用；验证页为 JS 滑块验证码，KOReader 无法内嵌渲染，必须借助浏览器）
+  - `Show Verification URL`：不支持外链的设备显示验证 URL 文本，可手动打开
+  - `I Have Verified - Continue Login`：验证完成后恢复轮询，登录自动完成
+  - `Restart Login (Fresh Cookies)`：`resetSession()` 清空被风控标记的 `d_c0` 设备 cookie 并重新获取初始 cookie、重新生成二维码
+  - `Cancel Login`：关闭二维码界面与菜单
+- **登录成功/登出时同步清理风控对话框状态**（`_risk_menu` / `_risk_verify_url`）
+- 版本号、About 信息与文档同步更新为 v128
 
 ### v127
 - **推荐流列表改为每批 12 条**：`getRecommendFeed` 增加累积上限（12 条）并在满批后截断；「Load More」游标在计数判断之前就已推进，始终从真实的下一页继续

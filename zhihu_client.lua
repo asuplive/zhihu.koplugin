@@ -556,22 +556,44 @@ function ZhihuClient:checkScanStatus(token)
 
     if body then
         local ok, data = pcall(decodeJSON, body)
-        if ok and data and data.status ~= nil then
-            local status = data.status
-            -- On confirm, Zhihu often sends the auth cookies inside the JSON "cookie" field.
-            if (status == 2 or status == "confirmed") and data.cookie then
-                self:_applyCookieString(tostring(data.cookie))
+        if ok and data then
+            -- v128: Zhihu risk control ("unhuman"). The API answers HTTP 403 with
+            -- error code 40352 and a redirect to a human-verification page when the
+            -- network is flagged (common on mobile-data / carrier NAT IPs, e.g.
+            -- Android phones). Such a response carries no "status" field, so the old
+            -- code treated it as "waiting" and polled forever ("no reaction" after
+            -- scanning). Surface it as "blocked" plus the verification URL instead.
+            if data.error and (data.error.need_login or data.error.code == 40352) then
+                self.last_error = data.error.message or "risk control blocked"
+                local verify_url = data.error.redirect
+                if verify_url then verify_url = tostring(verify_url) end
+                return "blocked", verify_url
             end
-            if self.cookie_jar:get("z_c0") then return "confirmed" end
-            if status == 0 then return "waiting" end
-            if status == 1 then return "scanned" end
-            if status == 2 then return "confirmed" end
-            if status == 3 then return "expired" end
+            if data.status ~= nil then
+                local status = data.status
+                -- On confirm, Zhihu often sends the auth cookies inside the JSON "cookie" field.
+                if (status == 2 or status == "confirmed") and data.cookie then
+                    self:_applyCookieString(tostring(data.cookie))
+                end
+                if self.cookie_jar:get("z_c0") then return "confirmed" end
+                if status == 0 then return "waiting" end
+                if status == 1 then return "scanned" end
+                if status == 2 then return "confirmed" end
+                if status == 3 then return "expired" end
+            end
         end
     end
 
     if code == 404 or code == 410 then return "expired" end
     return "waiting"
+end
+
+-- v128: Drop all cookies (including the risk-flagged d_c0 device id) and fetch
+-- a fresh set of initial cookies. Used by the risk-control dialog to retry
+-- login from a clean device identity.
+function ZhihuClient:resetSession()
+    self.cookie_jar:clear()
+    return self:getInitialCookies()
 end
 
 -- =========================================================================

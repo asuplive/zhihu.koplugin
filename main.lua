@@ -1,6 +1,7 @@
 --[[
-    Zhihu Reader Plugin for KOReader v127
+    Zhihu Reader Plugin for KOReader v128
     - QR code login: auto-completing poll login
+    - Risk-control (unhuman) verification flow for blocked networks (Android)
     - Recommended feed (12 items per batch) with Load More cursor
     - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
     - Mixed text and image display (图文混排)
@@ -296,7 +297,7 @@ function Zhihu:buildMenuItems()
         text = _("About"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v127\n\n- QR code login (auto-complete)\n- Recommended feed: 12 items per batch\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
+                text = _("Zhihu Reader v128\n\n- QR code login (auto-complete)\n- Risk-control verification flow (browser)\n- Recommended feed: 12 items per batch\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
                 timeout = 5,
             })
         end,
@@ -394,7 +395,7 @@ function Zhihu:_startLoginPoll(token)
     local plugin = self
     local function poll()
         if plugin._login_poll_token ~= token then return end
-        local ok, status = pcall(function() return plugin.client:checkScanStatus(token) end)
+        local ok, status, extra = pcall(function() return plugin.client:checkScanStatus(token) end)
         if not ok then
             -- Transient network error: retry shortly.
             plugin._login_poll_timer = UIManager:scheduleIn(3, poll)
@@ -405,12 +406,122 @@ function Zhihu:_startLoginPoll(token)
         elseif status == "expired" then
             plugin:_stopLoginPoll()
             UIManager:show(InfoMessage:new{text = _("QR code expired. Please try again."), timeout = 3})
+        elseif status == "blocked" then
+            -- v128: Zhihu risk control (403 / 40352) — human verification is
+            -- required before login polling can continue.
+            plugin:_handleRiskControl(token, extra)
         else
             -- "waiting" or "scanned": keep polling.
             plugin._login_poll_timer = UIManager:scheduleIn(2.5, poll)
         end
     end
     self._login_poll_timer = UIManager:scheduleIn(1.5, poll)
+end
+
+-- =========================================================================
+-- v128: Zhihu Risk Control ("unhuman" verification) handling
+--
+-- When the current network is flagged (typical on Android phones on mobile
+-- data), scan_info returns HTTP 403 with error 40352 and a redirect to a
+-- human-verification page. That page is a JavaScript slider captcha which
+-- KOReader cannot render, so we:
+--   1. Stop polling (instead of silently looping forever — the old "no
+--      reaction after scanning" symptom).
+--   2. Offer to open the verification URL in the system browser
+--      (Device:openLink works on Android), or show it as text.
+--   3. Let the user resume polling once the verification is done.
+--   4. Offer a restart with fresh cookies (new d_c0 device identity).
+-- The verification session is bound to this client's cookies, so completing
+-- it in the browser lifts the block for KOReader's own requests.
+-- =========================================================================
+
+function Zhihu:_showVerifyUrl(url)
+    url = url or self._risk_verify_url
+    if not url then
+        UIManager:show(InfoMessage:new{
+            text = _("No verification URL available.\nTry 'Restart Login (Fresh Cookies)'."),
+            timeout = 4,
+        })
+        return
+    end
+    UIManager:show(TextViewer:new{
+        title = _("Human Verification URL"),
+        text = _("Zhihu flagged this network as abnormal\n(risk control, code 40352).\n\nOpen this URL in any browser, finish the\nverification, then come back and tap\n'I Have Verified - Continue Login'.\n\n") .. url,
+        text_face = Font:getFace("cfont", 20),
+        justified = false,
+    })
+end
+
+function Zhihu:_handleRiskControl(token, verify_url)
+    self:_stopLoginPoll()
+    local plugin = self
+    self._risk_verify_url = verify_url
+
+    local items = {}
+    table.insert(items, {
+        text = _("Open Verification in Browser"),
+        callback = function()
+            local opened = false
+            if verify_url and Device.openLink then
+                opened = pcall(function() Device:openLink(verify_url) end)
+            end
+            if opened then
+                UIManager:show(InfoMessage:new{
+                    text = _("Finish the verification in the browser,\nthen tap 'I Have Verified - Continue Login'."),
+                    timeout = 6,
+                })
+            else
+                -- No system-browser bridge (or it failed): fall back to text.
+                plugin:_showVerifyUrl(verify_url)
+            end
+        end,
+    })
+    table.insert(items, {
+        text = _("Show Verification URL"),
+        callback = function()
+            plugin:_showVerifyUrl(verify_url)
+        end,
+    })
+    table.insert(items, {
+        text = _("I Have Verified - Continue Login"),
+        callback = function()
+            if token then plugin:_startLoginPoll(token) end
+        end,
+    })
+    table.insert(items, {
+        text = _("Restart Login (Fresh Cookies)"),
+        callback = function()
+            -- Drop the risk-flagged d_c0 and get a brand-new device identity.
+            pcall(function() plugin.client:resetSession() end)
+            plugin:startQrLogin()
+        end,
+    })
+    table.insert(items, {
+        text = _("Cancel Login"),
+        callback = function()
+            if plugin._qr_viewer then
+                pcall(function() UIManager:close(plugin._qr_viewer) end)
+                plugin._qr_viewer = nil
+            end
+            if plugin._risk_menu then
+                pcall(function() UIManager:close(plugin._risk_menu) end)
+                plugin._risk_menu = nil
+            end
+        end,
+    })
+
+    local menu = Menu:new{
+        title = _("Zhihu Verification Needed"),
+        item_table = items,
+        covers_fullscreen = true,
+        is_borderless = true,
+    }
+    function menu:onClose()
+        UIManager:close(menu)
+        return true
+    end
+    self._risk_menu = menu
+    UIManager:show(menu)
 end
 
 function Zhihu:_stopLoginPoll()
@@ -431,6 +542,12 @@ function Zhihu:_finishLogin(token)
         pcall(function() UIManager:close(self._qr_viewer) end)
         self._qr_viewer = nil
     end
+    -- v128: close the risk-control dialog if it is still open.
+    if self._risk_menu then
+        pcall(function() UIManager:close(self._risk_menu) end)
+        self._risk_menu = nil
+    end
+    self._risk_verify_url = nil
     -- Refresh the open Zhihu submenu so it shows the logged-in items.
     local w = self._menu_widget
     if w and w.updateItems then
@@ -447,6 +564,12 @@ function Zhihu:doLogout()
     self.cached_user_name = nil
     self._qr_viewer = nil
     self._menu_widget = nil
+    -- v128: drop risk-control state too
+    if self._risk_menu then
+        pcall(function() UIManager:close(self._risk_menu) end)
+        self._risk_menu = nil
+    end
+    self._risk_verify_url = nil
     -- v127 fix: drop the recommend-feed cursor so a new account
     -- does not "Load More" from the previous account's position
     self.feed_next_url = nil
