@@ -1,9 +1,13 @@
 --[[
-    Zhihu Reader Plugin for KOReader v128
+    Zhihu Reader Plugin for KOReader v132
     - QR code login: auto-completing poll login
     - Risk-control (unhuman) verification flow for blocked networks (Android)
     - Recommended feed (12 items per batch) with Load More cursor
     - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
+    - All article images load, auto-downscaled to screen width (e-ink safe)
+    - Per-article image cache: each image is downloaded once, stored in
+      zhihu_article_images/<id>/ and shown instantly on the next visit
+    - Download progress in a bottom status line, refreshed on page turns only
     - Mixed text and image display (图文混排)
     - Export to HTML & EPUB with auto-open
 ]]
@@ -56,6 +60,20 @@ end
 local DEFAULT_FONT_SIZE = 22
 local QR_POLL_INTERVAL = 3
 local QR_MAX_POLLS = 40
+
+-- v130: ALL images are loaded (the v129 count/size caps were removed per
+-- user requirement). Freeze protection now comes from downscaling instead:
+-- article_viewer.lua shrinks every image wider than the screen to a
+-- screen-width PNG before rendering, so an image-heavy article costs
+-- bounded memory per image instead of tens of MB per full-res photo.
+-- Downloads also show visible progress (i/N), refreshed on page turns only.
+--
+-- v132: images are cached per article under
+--   <data dir>/zhihu_article_images/<question or article id>/
+-- Every image is fetched exactly ONCE; later visits render the stored file
+-- immediately. Only a cached file larger than this (extremely rare) is
+-- dropped and re-fetched, because decoding it raw could stall the device.
+local CACHE_RENDER_LIMIT = 8 * 1024 * 1024 -- 8 MB
 
 -- CSS for ScrollHtmlWidget article rendering
 local ARTICLE_CSS = [[
@@ -297,7 +315,7 @@ function Zhihu:buildMenuItems()
         text = _("About"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v128\n\n- QR code login (auto-complete)\n- Risk-control verification flow (browser)\n- Recommended feed: 12 items per batch\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
+                text = _("Zhihu Reader v132\n\n- QR code login (auto-complete)\n- Risk-control verification flow (browser)\n- Recommended feed: 12 items per batch\n- All images load (downscaled to screen)\n- Image cache: download once, reuse\n- Progress in bottom status line\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
                 timeout = 5,
             })
         end,
@@ -796,21 +814,43 @@ function Zhihu:showArticle(question_id, title, item_type)
                     return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
                 end
 
+                -- v132: persistent image cache. Anything already stored in
+                -- the article folder is rendered straight away — no download,
+                -- no re-processing. Two cache names are accepted:
+                --   1. img_NNN.png  — downscaled screen-width copy (preferred)
+                --   2. img_NNN.<ext> — original file (small images, or images
+                --      the downscaler could not re-encode)
                 local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
-                local filename = string.format("img_%03d.%s", img_index, ext)
-                local filepath = article_dir .. filename
-
-                -- Check cache
-                local f = io.open(filepath, "rb")
-                if f then
-                    f:close()
-                    cached_count = cached_count + 1
-                    cached_map[url] = filename
-                    return '<img src="' .. filename .. '" alt=""/>'
-                else
-                    table.insert(pending_urls, {url = url, index = img_index})
-                    return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
+                local cached_name = nil
+                local candidates = {
+                    string.format("img_%03d.png", img_index),
+                    string.format("img_%03d.%s", img_index, ext),
+                }
+                for _, name in ipairs(candidates) do
+                    local f = io.open(article_dir .. name, "rb")
+                    if f then
+                        local size = f:seek("end") or 0
+                        f:close()
+                        -- v132: guard — an absurdly large cached file is
+                        -- re-fetched and downscaled instead of decoded raw
+                        if size > 0 and size <= CACHE_RENDER_LIMIT then
+                            cached_name = name
+                            break
+                        elseif size > 0 then
+                            os.remove(article_dir .. name)
+                        end
+                    end
                 end
+
+                if cached_name then
+                    cached_count = cached_count + 1
+                    cached_map[url] = cached_name
+                    return '<img src="' .. cached_name .. '" alt=""/>'
+                end
+
+                -- Not cached: queue it for one background download
+                table.insert(pending_urls, {url = url, index = img_index})
+                return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
             end)
 
             if cached_count > 0 then
@@ -1090,6 +1130,7 @@ function Zhihu:exportHtml()
         local data = readBinaryFile(tmp_path)
         pcall(function() os.remove(tmp_path) end)
         if not data or #data == 0 then return nil end
+        -- v130: no size limit — all images are exported (was capped at 3MB)
         local mime = (ext == "png") and "image/png" or (ext == "gif") and "image/gif" or "image/jpeg"
         return "data:" .. mime .. ";base64," .. base64Encode(data)
     end
@@ -1245,9 +1286,20 @@ function Zhihu:exportEpub()
         end
     end)
 
-    -- Download images
+    -- Download images (v129: with visible progress and a size cap so an
+    -- image-heavy article cannot stall the export for minutes on end)
     local url_to_file = {}
+    local progress_msg = nil
     for i, url in ipairs(img_urls) do
+        if progress_msg then
+            pcall(function() UIManager:close(progress_msg) end)
+        end
+        progress_msg = InfoMessage:new{
+            text = T(_("Downloading images (%1/%2)..."), i, #img_urls),
+            timeout = 0,
+        }
+        UIManager:show(progress_msg)
+
         local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
         local filename = string.format("img_%03d.%s", i, ext)
         local filepath = images_dir .. "/" .. filename
@@ -1256,13 +1308,16 @@ function Zhihu:exportEpub()
             return self.client:_downloadImage(url, filepath)
         end)
         if dl_ok and dl_result then
-            -- Verify file exists
+            -- Verify the file exists (v130: no size cap — export all images)
             local f = io.open(filepath, "rb")
             if f then
                 f:close()
                 url_to_file[url] = filepath
             end
         end
+    end
+    if progress_msg then
+        pcall(function() UIManager:close(progress_msg) end)
     end
 
     -- Replace img src with absolute paths for EpubBuilder
