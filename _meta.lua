@@ -8,5 +8,6 @@ Features:
 - Recommended feed with refresh button (requires login)
 - Read question answers with page turn
 - Article images (optional, viewable in image viewer)
+- Answerer avatars (optional, off by default)
 - Adjustable font size]]),
 }

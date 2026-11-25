@@ -1,5 +1,5 @@
 --[[
-    Zhihu Reader Plugin for KOReader v132
+    Zhihu Reader Plugin for KOReader v153
     - QR code login: auto-completing poll login
     - Risk-control (unhuman) verification flow for blocked networks (Android)
     - Recommended feed (12 items per batch) with Load More cursor
@@ -9,7 +9,22 @@
       zhihu_article_images/<id>/ and shown instantly on the next visit
     - Download progress in a bottom status line, refreshed on page turns only
     - Mixed text and image display (图文混排)
+    - v150: pictures are sized to the text column (not the raw screen) and
+      centred as inline content, so they no longer lean to the right
+    - v151: optional answerer avatar next to each author name (off by default)
+    - v153: every settings label is bilingual (Chinese / English)
+- v152: that avatar is sized 4x the body font (~88px at font 22), still
+      capped at 14% of the screen so it never crowds the author line
     - Export to HTML & EPUB with auto-open
+
+    v140 (paging / speed / font):
+    - Answers are fetched and rendered 5 at a time. The page ends with a
+      "下一个" button; tapping it (or the bottom bar) loads the next 5.
+    - Answer HTML is stripped down to what MuPDF can actually render before
+      layout, which is what makes long answers stop lagging on page turns.
+    - Fetched pages are cached on disk for one hour, so flipping back and
+      forth between batches is instant.
+    - New "Font Family" setting (presets + custom family name).
 ]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -58,8 +73,25 @@ local function utf8Truncate(s, max_len)
 end
 
 local DEFAULT_FONT_SIZE = 22
+-- v152: avatar side = body font size x scale (3=small, 4=large, 5=xlarge)
+local DEFAULT_AVATAR_SCALE = 4
+-- v151: show the answerer's avatar next to the name in front of each answer.
+-- Off by default: it costs one extra request per new author and the reader
+-- who only wants text should never pay for it.
+local DEFAULT_SHOW_AVATAR = false
+-- v146: paragraphs are indented by this many characters by default (2 = the
+-- classic Chinese first-line indent; 0 = flush left).
+local DEFAULT_PARA_INDENT = 2
+-- v148: give a content picture a page of its own (page break before/after),
+-- so a small picture is not squeezed into the leftover height of a text page.
+local DEFAULT_IMAGE_PAGE_BREAK = false
 local QR_POLL_INTERVAL = 3
 local QR_MAX_POLLS = 40
+
+-- v140: answers per page (fetch + render unit).
+local DEFAULT_PAGE_SIZE = 5
+-- v140: an answer page stays cached on disk for this long (seconds).
+local DEFAULT_CACHE_TTL = 3600
 
 -- v130: ALL images are loaded (the v129 count/size caps were removed per
 -- user requirement). Freeze protection now comes from downscaling instead:
@@ -75,10 +107,57 @@ local QR_MAX_POLLS = 40
 -- dropped and re-fetched, because decoding it raw could stall the device.
 local CACHE_RENDER_LIMIT = 8 * 1024 * 1024 -- 8 MB
 
+-- v140: Font Family setting --------------------------------------------------
+-- The value stored in settings is a CSS font-family NAME (not a file path):
+-- MuPDF resolves it against the fonts the device actually provides.
+local DEFAULT_CJK_FONT_STACK = '"Noto Serif CJK SC", "WenQuanYi Micro Hei", "Droid Sans Fallback", serif'
+
+-- Family names that are commonly present on e-ink readers, Android and
+-- desktop, plus the generic CSS families.
+local FONT_PRESETS = {
+    "Noto Serif CJK SC",
+    "Noto Sans CJK SC",
+    "Source Han Serif SC",
+    "Source Han Sans SC",
+    "Noto Serif",
+    "Noto Sans",
+    "Droid Sans Fallback",
+    "WenQuanYi Micro Hei",
+    "WenQuanYi Zen Hei",
+    "Songti SC",
+    "STSong",
+    "STKaiti",
+    "Heiti SC",
+    "STHeiti",
+    "SimSun",
+    "SimHei",
+    "KaiTi",
+    "Microsoft YaHei",
+    "PingFang SC",
+    "serif",
+    "sans-serif",
+    "monospace",
+}
+
+-- Turn a stored font name into a CSS font-family token. Generic families must
+-- stay bare ("serif"), everything else is quoted.
+local function cssFontFamily(name)
+    if not name or name == "" then return nil end
+    local n = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if n == "" then return nil end
+    local generic = { serif = true, ["sans-serif"] = true, monospace = true,
+                      cursive = true, fantasy = true }
+    if generic[n:lower()] then
+        return n:lower()
+    end
+    return '"' .. n:gsub('"', "") .. '"'
+end
+
 -- CSS for ScrollHtmlWidget article rendering
-local ARTICLE_CSS = [[
+-- __FONT_FAMILY__ is substituted by buildArticleCss().
+local ARTICLE_CSS_TEMPLATE = [[
 html, body {
-    font-family: "Noto Serif CJK SC", "WenQuanYi Micro Hei", serif;
+    font-family: __FONT_FAMILY__;
     line-height: 1.8;
     color: #000;
     margin: 0;
@@ -88,18 +167,23 @@ a {
     color: #000;
     text-decoration: none;
 }
+/* v141: the old 33%-wide / 180px-tall box looked like a broken thumbnail and
+   was easily mistaken for a picture that renders too small. */
 .img-placeholder {
     display: block;
-    width: 33%;
-    height: 180px;
-    border: 2px solid #000;
+    width: 86%;
+    border: 2px dashed #888;
     text-align: center;
-    line-height: 180px;
-    margin: 10px auto;
+    padding: 16px 0;
+    margin: 12px auto;
 }
 .img-num {
-    font-size: 1.5em;
-    font-weight: bold;
+    font-size: 1.2em;
+    color: #555;
+}
+.omitted {
+    color: #666;
+    font-style: italic;
 }
 .close-link {
     float: right;
@@ -117,13 +201,11 @@ h1.title {
     font-size: 1.6em;
     font-weight: bold;
 }
-.author {
-    font-style: italic;
-    margin-bottom: 2px;
-}
 h2.author {
     font-size: 1.3em;
     font-weight: bold;
+    font-style: italic;
+    margin-bottom: 2px;
 }
 .answer {
     margin-bottom: 12px;
@@ -131,26 +213,77 @@ h2.author {
     border-bottom: 1px dashed #888;
     margin-top: 0;
 }
-.author {
-    font-weight: bold;
-    font-style: italic;
-    margin-bottom: 2px;
-}
 .voteup {
     color: #666;
     margin-bottom: 6px;
     font-style: italic;
 }
 p {
-    text-indent: 0.5em;
+    /* v146: __PARA_INDENT__ is substituted by buildArticleCss(): the reader can
+       pick "no indent" (flush left) or the classic two-character indent. */
+    text-indent: __PARA_INDENT__;
     margin: 0 0 4px 0;
 }
 img {
-    width: 100%;
     max-width: 100%;
     height: auto;
-    display: block;
+    /* v150: pictures stay inline. A block image ignores text-align, so the
+       centred container had no effect and every picture hugged the left edge
+       of the column (with an over-wide one spilling past the right margin).
+       Inline is also what makes the container's text-align: center work. */
+    display: inline;
     margin: 0;
+}
+/* v151: the answerer's avatar. It sits inside the author heading, so its size
+   is tied to the heading's font size instead of the picture it came from, and
+   it is pushed down a touch so it lines up with the name rather than the
+   baseline of the text. */
+img.avatar {
+    /* v151/v152: the pixel size is carried by the width/height attributes
+       (crengine honours those, it does not resolve em on images); this rule
+       only keeps the picture on the author's line and off the column edges. */
+    max-width: 30%;
+    height: auto;
+    vertical-align: middle;
+    margin: 0 0.4em 0 0;
+}
+/* v141: crengine ignores width: 100% on <img>, so content pictures carry an
+   explicit pixel width attribute instead (see zhihu_client.getRenderImgWidth).
+   Emoji / stickers keep their intrinsic size. */
+img.full-img {
+    max-width: 100%;
+    /* v150: an inline picture obeys the parent block's text-align. The global
+       `img { display: block }` above is exactly what made v149's centring a
+       no-op: a block box ignores text-align, so the picture just sat on the
+       left edge of its block and an over-wide one spilled past the right
+       margin -- which reads as "still pushed to the right". */
+    display: inline;
+    margin: 0;
+    vertical-align: middle;
+}
+/* v150: a picture is wrapped in its own full-width block so text-align can
+   centre it. text-indent: 0 cancels the paragraph indent (2 characters) that
+   the picture's line box used to inherit and made everything drift right. */
+div.img-block {
+    text-align: center;
+    text-indent: 0;
+    margin: 0.8em 0;
+    padding: 0;
+    width: 100%;
+}
+div.page-img {
+    /* v148: give the picture a page of its own (crengine honours page-break on
+       a block box; an inline img is not reliable there). */
+    page-break-before: always;
+    page-break-after: always;
+    text-align: center;
+    text-indent: 0;
+    margin: 10px 0;
+    width: 100%;
+}
+img.tiny-img {
+    display: inline;
+    margin: 2px 3px;
 }
 blockquote {
     border-left: 3px solid #888;
@@ -172,7 +305,59 @@ h2, h3 {
     font-weight: bold;
     margin: 15px 0 10px 0;
 }
+
+/* v140: end-of-page navigation (next batch / previous batch) */
+.page-nav {
+    margin-top: 24px;
+    padding-top: 12px;
+    border-top: 2px solid #000;
+}
+.nav-hint {
+    text-align: center;
+    color: #444;
+    font-style: italic;
+    text-indent: 0;
+    margin: 12px 0;
+}
+.nav-btn {
+    text-align: center;
+    margin: 16px 0;
+    border: 2px solid #000;
+    padding: 12px 0;
+}
+.nav-btn a {
+    /* v140: block level, so the whole framed box is tappable (an inline link
+       would only react on the text glyphs, which is painful on e-ink). */
+    display: block;
+    padding: 4px 0;
+    font-weight: bold;
+    text-decoration: underline;
+}
+.nav-btn-small {
+    text-align: center;
+    margin: 10px 0;
+}
+.nav-btn-small a {
+    color: #555;
+}
 ]]
+
+-- Build the article stylesheet with the chosen font family on top of the
+-- built-in CJK stack (so an unresolvable name never blanks out Chinese text).
+-- v146: para_indent is the first-line indent of a paragraph, in characters:
+-- 0 = flush left, 2 = the classic two-character indent.
+local function buildArticleCss(font_name, para_indent)
+    local family = DEFAULT_CJK_FONT_STACK
+    local chosen = cssFontFamily(font_name)
+    if chosen then
+        family = chosen .. ", " .. DEFAULT_CJK_FONT_STACK
+    end
+    local indent = "2em"
+    if para_indent == 0 then indent = "0" end
+    local css = ARTICLE_CSS_TEMPLATE:gsub("__FONT_FAMILY__", function() return family end)
+    css = css:gsub("__PARA_INDENT__", function() return indent end)
+    return css
+end
 
 -- =========================================================================
 -- Plugin Module
@@ -195,6 +380,11 @@ function Zhihu:init()
     self._login_poll_token = nil
     self.client = ZhihuClient:new()
     self.client:init(DataStorage:getSettingsDir())
+    -- v140: on-disk cache for fetched answer pages
+    self.page_cache_dir = DataStorage:getDataDir() .. "/zhihu_pages/"
+    self.client:setCacheDir(self.page_cache_dir)
+    self.client:setCacheTTL(DEFAULT_CACHE_TTL)
+    os.execute("mkdir -p " .. shellQuote(self.page_cache_dir))
     self.qr_image_path = DataStorage:getDataDir() .. "/cache/zhihu_qrcode.png"
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
@@ -216,7 +406,7 @@ end
 function Zhihu:addToMainMenu(menu_items)
     local plugin = self
     menu_items.zhihu_reader = {
-        text = _("Zhihu Reader"),
+        text = _("知乎阅读器 (Zhihu Reader)"),
         sorting_hint = "tools",
         sub_item_table_func = function()
             return plugin:buildMenuItems()
@@ -235,19 +425,19 @@ function Zhihu:buildMenuItems()
             self.cached_user_name = user_name
         end
         if user_name and user_name ~= "" then
-            table.insert(sub_items, {text = _("User: ") .. user_name, enabled = false})
+            table.insert(sub_items, {text = _("用户 (User): ") .. user_name, enabled = false})
         end
         table.insert(sub_items, {
-            text = _("Recommended Feed"),
+            text = _("推荐流 (Recommended Feed)"),
             callback = function() self:showRecommendFeed() end,
         })
         table.insert(sub_items, {
-            text = _("Logout"),
+            text = _("退出登录 (Logout)"),
             callback = function() self:doLogout() end,
         })
     else
         table.insert(sub_items, {
-            text = _("Login with QR Code"),
+            text = _("扫码登录 (Login with QR Code)"),
             callback = function() self:startQrLogin() end,
         })
     end
@@ -255,19 +445,89 @@ function Zhihu:buildMenuItems()
     table.insert(sub_items, {
         text = "Font Size",
         sub_item_table = {
-            {text = _("Small (18)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 18 end,
+            {text = _("小 (Small 18)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 18 end,
              callback = function() self.settings:saveSetting("font_size", 18) self.updated = true end},
-            {text = _("Medium (22)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 22 end,
+            {text = _("中 (Medium 22)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 22 end,
              callback = function() self.settings:saveSetting("font_size", 22) self.updated = true end},
-            {text = _("Large (26)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 26 end,
+            {text = _("大 (Large 26)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 26 end,
              callback = function() self.settings:saveSetting("font_size", 26) self.updated = true end},
-            {text = _("Extra Large (30)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 30 end,
+            {text = _("特大 (Extra Large 30)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 30 end,
              callback = function() self.settings:saveSetting("font_size", 30) self.updated = true end},
         },
     })
 
     table.insert(sub_items, {
-        text = _("Show Images"),
+        text = _("段落首行缩进 (Paragraph Indent)"),
+        sub_item_table = {
+            {text = _("不缩进（贴最左）/ No Indent"),
+             checked_func = function() return self:getParaIndent() == 0 end,
+             callback = function()
+                 self.settings:saveSetting("para_indent", 0)
+                 self.updated = true
+             end},
+            {text = _("缩进两个汉字 / Indent 2 Chars"),
+             checked_func = function() return self:getParaIndent() == DEFAULT_PARA_INDENT end,
+             callback = function()
+                 self.settings:saveSetting("para_indent", DEFAULT_PARA_INDENT)
+                 self.updated = true
+             end},
+        },
+    })
+
+    table.insert(sub_items, {
+        text = _("图片排版 (Picture Layout)"),
+        sub_item_table = {
+            {text = _("图片与上下文字留白（默认）/ Margin (Default)"),
+             checked_func = function() return not self:getImagePageBreak() end,
+             callback = function()
+                 self.settings:saveSetting("image_page_break", false)
+                 self.updated = true
+             end},
+            {text = _("图片单独占一页（另起页显示）/ Own Page"),
+             checked_func = function() return self:getImagePageBreak() end,
+             callback = function()
+                 self.settings:saveSetting("image_page_break", true)
+                 self.updated = true
+             end},
+        },
+    })
+
+    table.insert(sub_items, {
+        text = _("显示回答问题人头像 (Answerer Avatar)"),
+        checked_func = function() return self:getShowAvatar() end,
+        callback = function()
+            local current = self:getShowAvatar()
+            self.settings:saveSetting("show_avatar", not current)
+            self.updated = true
+            UIManager:show(InfoMessage:new{
+                text = T(_("Answerer avatar: %1"), not current and _("On") or _("Off")),
+                timeout = 2,
+            })
+        end,
+    })
+
+    table.insert(sub_items, {
+        text = _("头像大小 (Avatar Size)"),
+        sub_item_table = {
+            {text = _("小（正文 3 倍）/ Small (3x)"),
+             checked_func = function() return self:getAvatarScale() == 3 end,
+             callback = function() self.settings:saveSetting("avatar_scale", 3) self.updated = true end},
+            {text = _("大（正文 4 倍，默认）/ Large (4x, Default)"),
+             checked_func = function() return self:getAvatarScale() == DEFAULT_AVATAR_SCALE end,
+             callback = function() self.settings:saveSetting("avatar_scale", DEFAULT_AVATAR_SCALE) self.updated = true end},
+            {text = _("超大（正文 5 倍）/ Extra Large (5x)"),
+             checked_func = function() return self:getAvatarScale() == 5 end,
+             callback = function() self.settings:saveSetting("avatar_scale", 5) self.updated = true end},
+        },
+    })
+
+    table.insert(sub_items, {
+        text = _("字体设置 (Font Family)"),
+        sub_item_table_func = function() return self:buildFontMenu() end,
+    })
+
+    table.insert(sub_items, {
+        text = _("显示图片 (Show Images)"),
         checked_func = function() return self.settings:readSetting("show_images", false) end,
         callback = function()
             local current = self.settings:readSetting("show_images", false)
@@ -281,7 +541,7 @@ function Zhihu:buildMenuItems()
     })
 
     table.insert(sub_items, {
-        text = _("View Images"),
+        text = _("查看图片 (View Images)"),
         enabled_func = function()
             return self.current_article ~= nil
                 and self.current_article.image_list
@@ -291,12 +551,17 @@ function Zhihu:buildMenuItems()
     })
 
     table.insert(sub_items, {
-        text = _("Clear Image Cache"),
+        text = _("清除图片缓存 (Clear Image Cache)"),
         callback = function() self:clearCache() end,
     })
 
     table.insert(sub_items, {
-        text = _("Export HTML"),
+        text = _("清除页面缓存 (Clear Page Cache)"),
+        callback = function() self:clearPageCache() end,
+    })
+
+    table.insert(sub_items, {
+        text = _("导出 HTML (Export HTML)"),
         enabled_func = function()
             return self.current_article ~= nil
         end,
@@ -304,7 +569,7 @@ function Zhihu:buildMenuItems()
     })
 
     table.insert(sub_items, {
-        text = _("Export EPUB"),
+        text = _("导出 EPUB (Export EPUB)"),
         enabled_func = function()
             return self.current_article ~= nil
         end,
@@ -312,10 +577,10 @@ function Zhihu:buildMenuItems()
     })
 
     table.insert(sub_items, {
-        text = _("About"),
+        text = _("关于 (About)"),
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v132\n\n- QR code login (auto-complete)\n- Risk-control verification flow (browser)\n- Recommended feed: 12 items per batch\n- All images load (downscaled to screen)\n- Image cache: download once, reuse\n- Progress in bottom status line\n- ArticleViewer with optimized layout\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
+                text = _("Zhihu Reader v140\n\n- QR code login (auto-complete)\n- Risk-control verification flow (browser)\n- Recommended feed: 12 items per batch\n- Answers: 5 per page, 'Next' button for more\n- Lightweight HTML for smooth page turns\n- Page cache: 1 hour on disk\n- Font family + font size settings\n- All images load (downscaled to screen)\n- Image cache: download once, reuse\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
                 timeout = 5,
             })
         end,
@@ -714,19 +979,21 @@ function Zhihu:_loadRecommendFeed(start_url)
 
     -- Remember the cursor so "Load More" loads the next batch instead of re-fetching the top.
     self.feed_next_url = next_url
-    self:_loadFeedMenu(items, _("Recommended Feed"), true)
+    self:_loadFeedMenu(items, _("推荐流 (Recommended Feed)"), true)
 end
 
 -- =========================================================================
 -- Read Article (ArticleViewer with ScrollHtmlWidget)
 -- =========================================================================
 
-function Zhihu:showArticle(question_id, title, item_type)
+function Zhihu:showArticle(question_id, title, item_type, offset)
     if NetworkMgr and NetworkMgr.isOnline and not NetworkMgr:isOnline() then
         UIManager:show(InfoMessage:new{text = _("Device is offline."), timeout = 3})
         return
     end
 
+    offset = tonumber(offset) or 0
+    item_type = item_type or "answer"
     local show_images = self.settings:readSetting("show_images", false)
 
     -- v127: cut on a UTF-8 boundary instead of raw bytes
@@ -737,63 +1004,117 @@ function Zhihu:showArticle(question_id, title, item_type)
         timeout = 0,
     }
     UIManager:show(loading)
+    -- v140: force a repaint, otherwise the (blocking) request below freezes
+    -- the screen before the loading hint is ever drawn.
+    if UIManager.forceRePaint then
+        pcall(function() UIManager:forceRePaint() end)
+    end
 
-    -- Get HTML content from zhihu_client
-    local html_content = self.client:getAnswersHtml(question_id, title, item_type)
+    -- v140: fetch/render one page of answers (5) instead of the whole thread.
+    -- v151: the avatar setting decides whether the page HTML carries an
+    -- <img class="avatar"> at all (and which on-disk page cache is used).
+    self.client.show_avatar = self:getShowAvatar()
+    local html_content, page_info = self.client:getAnswersPage(
+        question_id, title, item_type, offset, DEFAULT_PAGE_SIZE)
 
     if not html_content then
-        -- Fallback: try text version and wrap in basic HTML
+        local last_err = type(page_info) == "string" and page_info or (self.client:getLastError() or "")
+        if offset > 0 then
+            UIManager:close(loading)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Load failed: %1"), last_err ~= "" and last_err or _("No more answers")),
+                timeout = 6,
+            })
+            return
+        end
+        -- Fallback for the first page only: plain text, wrapped in basic HTML
         local text = self.client:getAnswers(question_id, title, item_type, false)
         UIManager:close(loading)
         if not text then
-            local last_err = self.client:getLastError() or ""
             UIManager:show(InfoMessage:new{
                 text = T(_("Load failed: %1"), last_err),
                 timeout = 8,
             })
             return
         end
-        -- Convert plain text to simple HTML
         html_content = "<div class='title'>" .. (title or "") .. "</div>"
         local escaped = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
         escaped = escaped:gsub("\n\n", "</p><p>")
         escaped = escaped:gsub("\n", "<br/>")
         html_content = html_content .. "<p>" .. escaped .. "</p>"
+        page_info = { offset = 0, limit = DEFAULT_PAGE_SIZE, count = 1, has_more = false }
     else
         UIManager:close(loading)
     end
+
+    page_info = page_info or {}
+    local page_limit = tonumber(page_info.limit) or DEFAULT_PAGE_SIZE
+    local has_more = page_info.has_more and true or false
 
     self.current_article = {
         question_id = question_id,
         title = title,
         item_type = item_type,
         image_list = {},
+        page_offset = offset,
+    }
+
+    -- v140: remember the current batch so "next"/"previous" know what to load.
+    self.read_ctx = {
+        question_id = question_id,
+        title = title,
+        item_type = item_type,
+        offset = offset,
+        limit = page_limit,
+        has_more = has_more,
     }
 
     local font_size = self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)
+    local font_name = self:getFontName()
+
+    -- v140: "下一个" lives at the end of the page, right after the last answer.
+    html_content = html_content .. self:_buildPageNav(offset, page_info)
+
+    -- v151: author avatars. They live next to the batch's pictures (one folder
+    -- per batch), are fetched before the viewer is built so the very first
+    -- page already shows them, and are kept out of the picture pipeline below
+    -- (they are neither numbered nor replaced by a "[图片N]" placeholder).
+    local show_avatar = self:getShowAvatar()
+    local avatar_ready = false
+    local article_dir = nil
+    if show_images or show_avatar then
+        -- v140: each batch keeps its own image folder, so image numbering of
+        -- one batch never overwrites the files of another.
+        article_dir = DataStorage:getDataDir() .. "/zhihu_article_images/" .. question_id .. "/"
+        if offset > 0 then
+            article_dir = article_dir .. "p" .. offset .. "/"
+        end
+        os.execute("mkdir -p " .. shellQuote(article_dir))
+    end
+    if show_avatar and article_dir then
+        local inlined, used = self:_inlineAvatars(html_content, article_dir)
+        html_content = inlined
+        avatar_ready = used and true or false
+    else
+        -- off: drop the markup itself, the answerer's name stays
+        html_content = html_content:gsub('<img%s[^>]-class="avatar"[^>]*>', "")
+    end
 
     -- Handle images: download to local dir (if enabled) or strip from HTML
     -- v124: Per-article cache with single-pass replacement.
     -- Each <img> is either replaced with local path (cached) or placeholder (pending).
-    local image_dir = nil
+    local image_dir = avatar_ready and article_dir or nil
     local pending_urls = nil
     -- v127 fix: hoisted to function scope so it is actually passed to ArticleViewer.
-    -- (Previously declared inside the `if` block, so `image_map = cached_map` below
-    -- read an undefined global and the v126 "keep cached images on refresh" fix
-    -- never took effect.)
     local cached_map = {}
     local full_html = html_content
-    local article_dir = nil
     if show_images then
-        -- Create article-specific cache directory
-        article_dir = DataStorage:getDataDir() .. "/zhihu_article_images/" .. question_id .. "/"
-        os.execute("mkdir -p " .. shellQuote(article_dir))
-
         -- Extract image URLs from HTML
         local img_urls = {}
         local seen = {}
         html_content:gsub('<img[^>]-src="([^"]*)"', function(url)
-            if url and url ~= "" and not seen[url] then
+            -- v151: avatars are already local files, not part of "View Images"
+            if url and url ~= "" and url:match("^https?://") and not seen[url] then
                 seen[url] = true
                 table.insert(img_urls, url)
             end
@@ -808,18 +1129,16 @@ function Zhihu:showArticle(question_id, title, item_type)
 
             -- Single-pass: replace each <img> with either local file or placeholder
             html_content = html_content:gsub('<img([^>]*)>', function(attrs)
+                -- v151: an avatar is a local file already; leave it alone and
+                -- keep it out of the picture numbering (indexes must match the
+                -- ones article_viewer counts on the same HTML).
+                if attrs:find('class="avatar"', 1, true) then return nil end
                 img_index = img_index + 1
                 local url = attrs:match('src="([^"]*)"') or attrs:match("src='([^']*)")
                 if not url or url == "" then
                     return '<div class="img-placeholder"><span class="img-num">[图片' .. img_index .. ']</span></div>'
                 end
 
-                -- v132: persistent image cache. Anything already stored in
-                -- the article folder is rendered straight away — no download,
-                -- no re-processing. Two cache names are accepted:
-                --   1. img_NNN.png  — downscaled screen-width copy (preferred)
-                --   2. img_NNN.<ext> — original file (small images, or images
-                --      the downscaler could not re-encode)
                 local ext = url:match("%.(%w+)[?]") or url:match("%.(%w+)$") or "jpg"
                 local cached_name = nil
                 local candidates = {
@@ -831,8 +1150,6 @@ function Zhihu:showArticle(question_id, title, item_type)
                     if f then
                         local size = f:seek("end") or 0
                         f:close()
-                        -- v132: guard — an absurdly large cached file is
-                        -- re-fetched and downscaled instead of decoded raw
                         if size > 0 and size <= CACHE_RENDER_LIMIT then
                             cached_name = name
                             break
@@ -845,7 +1162,16 @@ function Zhihu:showArticle(question_id, title, item_type)
                 if cached_name then
                     cached_count = cached_count + 1
                     cached_map[url] = cached_name
-                    return '<img src="' .. cached_name .. '" alt=""/>'
+                    -- v147: hand the cached path over *with* the size
+                    -- attributes. Dropping them made a cached picture render
+                    -- at its intrinsic pixel size, i.e. tiny, while the same
+                    -- picture looked right on the first visit.
+                    local wpx = attrs:match('width%s*=%s*"(%d+)"')
+                    local icls = attrs:match('class%s*=%s*"([^"]*)"')
+                    local out = '<img src="' .. cached_name .. '"'
+                    if wpx then out = out .. ' width="' .. wpx .. '"' end
+                    if icls then out = out .. ' class="' .. icls .. '"' end
+                    return out .. '/>'
                 end
 
                 -- Not cached: queue it for one background download
@@ -861,6 +1187,8 @@ function Zhihu:showArticle(question_id, title, item_type)
         local img_index = 0
         local img_urls = {}
         html_content = html_content:gsub('<img([^>]*)>', function(attrs)
+            -- v151: avatars survive "Show Images" being off
+            if attrs:find('class="avatar"', 1, true) then return nil end
             img_index = img_index + 1
             local url = attrs:match('src="([^"]*)"') or attrs:match("src='([^']*)")
             if url and url ~= "" then
@@ -873,21 +1201,30 @@ function Zhihu:showArticle(question_id, title, item_type)
 
     -- Try ArticleViewer first, fallback to TextViewer if it crashes
     local ok_viewer = pcall(function()
-        UIManager:show(ArticleViewer:new{
+        local viewer = ArticleViewer:new{
             html_content = html_content,
-            css = ARTICLE_CSS,
+            css = buildArticleCss(font_name, self:getParaIndent()),
             image_dir = image_dir,
+            image_page_break = self:getImagePageBreak(),
             font_size = font_size,
-            -- v122: Pass cache info for background download
             full_html = full_html,
             pending_urls = pending_urls,
             image_map = cached_map,
             article_dir = article_dir,
             plugin = self,
-        })
+            -- v140: batch navigation, driven by the ScrollHtmlWidget link
+            -- callback and by the bottom status bar buttons.
+            has_next_page = has_more,
+            has_prev_page = (offset > 0),
+            on_next_page = function() self:_gotoAnswersPage(1) end,
+            on_prev_page = function() self:_gotoAnswersPage(-1) end,
+        }
+        self.current_viewer = viewer
+        UIManager:show(viewer)
     end)
 
     if not ok_viewer then
+        self.current_viewer = nil
         -- Fallback to plain TextViewer if ArticleViewer crashes
         UIManager:show(InfoMessage:new{
             text = _("Article viewer unavailable, using text mode."),
@@ -902,6 +1239,307 @@ function Zhihu:showArticle(question_id, title, item_type)
         })
     end
 end
+
+-- =========================================================================
+-- v140: answer paging helpers
+-- =========================================================================
+
+-- HTML block placed after the last answer of the current batch.
+function Zhihu:_buildPageNav(offset, info)
+    info = info or {}
+    local limit = tonumber(info.limit) or DEFAULT_PAGE_SIZE
+    local count = tonumber(info.count) or limit
+    local first_no = offset + 1
+    local last_no = offset + count
+    local parts = {}
+    table.insert(parts, '<div class="page-nav">')
+    if count > 0 then
+        table.insert(parts, string.format('<p class="nav-hint">%s</p>',
+            T(_("第 %1 - %2 条回答"), first_no, last_no)))
+    end
+    if info.has_more then
+        table.insert(parts, string.format('<div class="nav-btn"><a href="zhihu://next">%s</a></div>',
+            T(_("下一个（再看 %1 条）"), limit)))
+    elseif offset > 0 then
+        table.insert(parts, string.format('<p class="nav-hint">%s</p>', _("已经是最后一页了")))
+    end
+    if offset > 0 then
+        table.insert(parts, string.format('<div class="nav-btn-small"><a href="zhihu://prev">%s</a></div>',
+            _("‹ 上一批")))
+    end
+    table.insert(parts, '</div>')
+    return table.concat(parts, "\n")
+end
+
+-- dir = 1 -> next batch, -1 -> previous batch
+function Zhihu:_gotoAnswersPage(dir)
+    local ctx = self.read_ctx
+    if not ctx then return end
+    local limit = tonumber(ctx.limit) or DEFAULT_PAGE_SIZE
+    local new_offset = (tonumber(ctx.offset) or 0) + dir * limit
+    if new_offset < 0 then new_offset = 0 end
+    if new_offset == (tonumber(ctx.offset) or 0) then return end
+    if dir > 0 and not ctx.has_more then
+        UIManager:show(InfoMessage:new{text = _("No more answers"), timeout = 2})
+        return
+    end
+    -- v140: close the current viewer first; otherwise stale widgets pile up
+    -- and the device gets slower with every batch.
+    if self.current_viewer then
+        local viewer = self.current_viewer
+        self.current_viewer = nil
+        pcall(function() UIManager:close(viewer) end)
+    end
+    self:showArticle(ctx.question_id, ctx.title, ctx.item_type, new_offset)
+end
+
+-- =========================================================================
+-- v140: font family setting
+-- =========================================================================
+
+function Zhihu:getFontName()
+    local name = self.settings:readSetting("font_family", "")
+    if type(name) ~= "string" then return nil end
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return nil end
+    return name
+end
+
+function Zhihu:setFontName(name)
+    self.settings:saveSetting("font_family", name or "")
+    self.updated = true
+end
+
+-- v148: should a content picture start on a page of its own?
+function Zhihu:getImagePageBreak()
+    return self.settings:readSetting("image_page_break", DEFAULT_IMAGE_PAGE_BREAK) == true
+end
+
+-- v146: first-line indent of a paragraph, in characters (0 or 2).
+function Zhihu:getParaIndent()
+    local v = self.settings:readSetting("para_indent", DEFAULT_PARA_INDENT)
+    if v == 0 or v == "0" then return 0 end
+    return DEFAULT_PARA_INDENT
+end
+
+-- v151: should the answerer's avatar be shown in front of the answer?
+function Zhihu:getShowAvatar()
+    return self.settings:readSetting("show_avatar", DEFAULT_SHOW_AVATAR) == true
+end
+
+-- v152: avatar side length = body font size x this factor (3 / 4 / 5)
+function Zhihu:getAvatarScale()
+    local v = tonumber(self.settings:readSetting("avatar_scale", DEFAULT_AVATAR_SCALE)) or DEFAULT_AVATAR_SCALE
+    if v < 2 then v = 2 elseif v > 6 then v = 6 end
+    return math.floor(v)
+end
+
+-- v151: deterministic, filesystem-safe file name for an avatar URL. The last
+-- path segment of a Zhihu avatar is a content hash (v2-<hash>_m.jpg), so the
+-- same author always maps to the same file and is downloaded exactly once.
+function Zhihu:_avatarFileName(url)
+    local tail = url:match("([^/%?]+)$") or "avatar.jpg"
+    tail = tail:gsub("%?.*$", "")
+    tail = tail:gsub("[^%w%._%-]", "_")
+    if tail == "" or tail == "." or tail == ".." then tail = "avatar.jpg" end
+    if #tail > 60 then tail = tail:sub(-60) end
+    return "av_" .. tail
+end
+
+-- v151: turn every <img class="avatar" src="https://..."> into a local file
+-- reference. Avatars are small and there are at most a handful per page, so
+-- they are fetched right here (blocking, once) instead of going through the
+-- background picture pipeline: that keeps them independent from "Show Images"
+-- and they are on the very first page the reader sees. A failed download just
+-- drops the picture and leaves the name.
+function Zhihu:_inlineAvatars(html, dir)
+    if not html or html == "" or not dir then return html, false end
+    local used = false
+    local resolved = {}
+    -- v152: v151 sized the avatar at 1.4x the body font (~30px) and it was too
+    -- small to make out on an e-ink screen. 4x the font size (or a bit less on
+    -- a narrow screen) is a face you can actually recognise, while still
+    -- fitting next to the author line.
+    local font_size = tonumber(self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)) or DEFAULT_FONT_SIZE
+    local avatar_px = math.floor(font_size * self:getAvatarScale())
+    local ok_w, screen_w = pcall(function() return Screen:getWidth() end)
+    if ok_w and tonumber(screen_w) then
+        local cap = math.floor(screen_w * 0.16)
+        if avatar_px > cap then avatar_px = cap end
+    end
+    if avatar_px < 64 then avatar_px = 64 end
+    html = html:gsub('<img([^>]-class="avatar"[^>]*)>', function(attrs)
+        local url = attrs:match('src="([^"]*)"') or attrs:match("src='([^']*)'")
+        if not url or url == "" then return "" end
+        if not url:match("^https?://") then return nil end
+
+        if resolved[url] == nil then
+            local name = self:_avatarFileName(url)
+            local path = dir .. name
+            local f = io.open(path, "rb")
+            local size = 0
+            if f then size = f:seek("end") or 0 f:close() end
+            if size > 0 then
+                resolved[url] = name
+            else
+                -- v152: the feed hands out a small (_m/_s/_l) avatar, which is
+                -- blurry once blown up to avatar_px. Ask for the _xl variant
+                -- first and fall back to the original on any failure.
+                local hi_url = url
+                local u = url
+                if u:match("_[mslb]%.jpg$") then
+                    hi_url = u:gsub("_[mslb]%.jpg$", "_xl.jpg")
+                end
+                local name_hi = name
+                if hi_url ~= url then
+                    name_hi = (name:gsub("%.jpg$", "_xl.jpg"))
+                    if name_hi == name then name_hi = name .. "_xl" end
+                end
+                local path_hi = dir .. name_hi
+                local picked = false
+                if hi_url ~= url then
+                    local fh = io.open(path_hi, "rb")
+                    local sh = 0
+                    if fh then sh = fh:seek("end") or 0 fh:close() end
+                    if sh > 0 then
+                        picked = true
+                        name, path = name_hi, path_hi
+                    else
+                        local okh = false
+                        pcall(function()
+                            okh = self.client:downloadFile(hi_url, path_hi, "https://www.zhihu.com/") and true or false
+                        end)
+                        local f2h = io.open(path_hi, "rb")
+                        local s2h = 0
+                        if f2h then s2h = f2h:seek("end") or 0 f2h:close() end
+                        if okh and s2h > 0 then
+                            picked = true
+                            name, path = name_hi, path_hi
+                        else
+                            pcall(os.remove, path_hi)
+                        end
+                    end
+                end
+                if picked then
+                    resolved[url] = name
+                else
+                    local ok = false
+                    pcall(function()
+                        ok = self.client:downloadFile(url, path, "https://www.zhihu.com/") and true or false
+                    end)
+                    local f2 = io.open(path, "rb")
+                    local size2 = 0
+                    if f2 then size2 = f2:seek("end") or 0 f2:close() end
+                    if ok and size2 > 0 then
+                        resolved[url] = name
+                    else
+                        pcall(os.remove, path)
+                        resolved[url] = false
+                    end
+                end
+            end
+        end
+
+        if resolved[url] then
+            used = true
+            return '<img class="avatar" src="' .. resolved[url]
+                .. '" width="' .. avatar_px .. '" height="' .. avatar_px .. '"/>'
+        end
+        return ""
+    end)
+    return html, used
+end
+
+function Zhihu:buildFontMenu()
+    local items = {}
+    table.insert(items, {
+        text = _("默认（内置中文字体栈）/ Default"),
+        checked_func = function() return self:getFontName() == nil end,
+        callback = function()
+            self:setFontName(nil)
+            UIManager:show(InfoMessage:new{text = _("字体：默认（重新打开文章生效）"), timeout = 2})
+        end,
+    })
+    table.insert(items, {text = "----------------"})
+
+    for _idx, name in ipairs(FONT_PRESETS) do
+        table.insert(items, {
+            text = name,
+            checked_func = function() return self:getFontName() == name end,
+            callback = function()
+                self:setFontName(name)
+                UIManager:show(InfoMessage:new{text = T(_("字体：%1（重新打开文章生效）"), name), timeout = 2})
+            end,
+        })
+    end
+
+    table.insert(items, {text = "----------------"})
+    table.insert(items, {
+        text = _("自定义字体名... / Custom Font Name"),
+        checked_func = function()
+            local n = self:getFontName()
+            if not n then return false end
+            for _i, preset in ipairs(FONT_PRESETS) do
+                if preset == n then return false end
+            end
+            return true
+        end,
+        callback = function() self:showFontInput() end,
+    })
+    return items
+end
+
+function Zhihu:showFontInput()
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("自定义字体名"),
+        description = _("填写本机已安装的字体族名，\n例如 Noto Serif CJK SC"),
+        input = self:getFontName() or "",
+        buttons = {
+            {
+                {
+                    text = _("取消 (Cancel)"),
+                    id = "close",
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("应用 (Apply)"),
+                    is_enter_default = true,
+                    callback = function()
+                        local value = dialog:getInputText() or ""
+                        value = value:gsub("^%s+", ""):gsub("%s+$", "")
+                        UIManager:close(dialog)
+                        if value == "" then
+                            self:setFontName(nil)
+                            UIManager:show(InfoMessage:new{text = _("字体：默认（重新打开文章生效）"), timeout = 2})
+                        else
+                            self:setFontName(value)
+                            UIManager:show(InfoMessage:new{text = T(_("字体：%1（重新打开文章生效）"), value), timeout = 2})
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    if dialog.onShowKeyboard then
+        dialog:onShowKeyboard()
+    end
+end
+
+-- =========================================================================
+-- v140: page cache maintenance
+-- =========================================================================
+
+function Zhihu:clearPageCache()
+    local removed = self.client:clearPageCache()
+    UIManager:show(InfoMessage:new{
+        text = T(_("Page cache cleared (%1 files)."), tonumber(removed) or 0),
+        timeout = 2,
+    })
+end
+
 
 -- =========================================================================
 -- Image Viewer for Article Images
@@ -1165,7 +1803,7 @@ function Zhihu:exportHtml()
         .. '*{margin:0;padding:0;}\n'
         .. 'body{font-family:serif;line-height:2.2;font-size:36px;color:#000;}\n'
         .. '.title{font-size:38px;font-weight:bold;text-align:center;margin:0;padding:10px 0 15px 0;border-bottom:3px solid #000;}\n'
-        .. 'p{text-indent:2em;margin:0 0 15px 0;}\n'
+        .. 'p{text-indent:' .. (self:getParaIndent() == 0 and "0" or "2em") .. ';margin:0 0 15px 0;}\n'
         .. '.answer{margin:0 0 30px 0;padding:0 0 20px 0;border-bottom:2px dashed #888;}\n'
         .. '.author{font-weight:bold;font-size:28px;color:#000;margin:0 0 5px 0;text-indent:0;}\n'
         .. '.voteup{font-size:22px;color:#444;margin:0 0 15px 0;text-indent:0;}\n'

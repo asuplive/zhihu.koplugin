@@ -1,7 +1,8 @@
 --[[
-    Zhihu Client Module for KOReader  (v39)
+    Zhihu Client Module for KOReader  (v140)
     - EPUB content generation (HTML format)
     - Synchronous HTTP, robust cookie parsing
+    - Paged answer rendering (5 answers per page) with an on-disk page cache
 ]]
 
 local https = require("ssl.https")
@@ -17,6 +18,54 @@ local USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
     .. " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 local SEPARATOR = string.rep("-", 42)
+
+-- v141: crengine lays an <img> out at its bitmap size and ignores
+-- `img { width: 100% }` from the stylesheet, which is why some answers show a
+-- postage-stamp picture. Declaring a pixel width on the tag itself is honoured
+-- by crengine, so ask the device once for the usable text width.
+local Screen
+do
+    local ok_dev, dev = pcall(require, "device")
+    if ok_dev and dev then Screen = dev.screen end
+end
+
+local DEFAULT_IMG_WIDTH
+local function getRenderImgWidth()
+    if DEFAULT_IMG_WIDTH ~= nil then return DEFAULT_IMG_WIDTH end
+    local w
+    if Screen and Screen.getWidth then
+        local ok, sw = pcall(function() return Screen:getWidth() end)
+        if ok then w = sw end
+    end
+    if type(w) ~= "number" or w <= 0 then
+        DEFAULT_IMG_WIDTH = false -- unknown: leave the tag untouched
+        return false
+    end
+    -- ScrollHtmlWidget reserves a scroll bar plus a spacer: stay inside the
+    -- text column so crengine does not have to shrink the image a second time.
+    -- v150: the column is inset by the page margin on *both* sides. Sizing the
+    -- picture to the raw screen width made it wider than the column, and the
+    -- overflow ran past the right margin (the "picture still leans right"
+    -- report). Reserve a symmetric 7% margin, never less than scaleBySize(10),
+    -- matching what article_viewer uses as its target width.
+    local side = math.floor(w * 0.07)
+    local min_side = 16
+    if Screen.scaleBySize then
+        local ok, m = pcall(function() return Screen:scaleBySize(10) end)
+        if ok and type(m) == "number" and m > 0 then min_side = m end
+    end
+    if side < min_side then side = min_side end
+    DEFAULT_IMG_WIDTH = w - 2 * side
+    return DEFAULT_IMG_WIDTH
+end
+
+-- v140: how many answers are rendered / fetched per page.
+local DEFAULT_PAGE_SIZE = 5
+-- v140: how long a fetched answer page stays valid in the on-disk cache.
+local DEFAULT_CACHE_TTL = 3600
+-- v140: upper bound for a single answer's HTML. Longer answers are cut with a
+-- hint: one huge answer is what turns page turns into multi-second waits.
+local MAX_ANSWER_HTML_BYTES = 120 * 1024
 
 -- =========================================================================
 -- Helpers
@@ -206,6 +255,181 @@ local function cleanHtmlForEpub(html)
     return html
 end
 
+-- =========================================================================
+-- v140: Render-oriented HTML cleaning.
+--
+-- The answers API returns very rich markup: inline `style=`, `class=`,
+-- `data-*` attributes, duplicate <noscript> images, <svg> formulas and even
+-- <script> blocks. MuPDF (the engine behind ScrollHtmlWidget) builds a DOM
+-- node for every one of those, so layout cost grows with the *markup volume*,
+-- not with the visible text. Stripping what MuPDF cannot use is what makes a
+-- long answer stop feeling sluggish when turned page by page.
+--
+-- The output is also made strictly XHTML-safe (self-closed empty tags and
+-- numeric entities only) so MuPDF can use its fast XML parser instead of
+-- silently falling back to the HTML5 (gumbo) parser.
+-- =========================================================================
+
+local NAMED_ENTITIES = {
+    nbsp = "#160", lt = "#60", gt = "#62", amp = "#38", quot = "#34", apos = "#39",
+    hellip = "#8230", mdash = "#8212", ndash = "#8211",
+    ldquo = "#8220", rdquo = "#8221", lsquo = "#8216", rsquo = "#8217",
+    middot = "#183", times = "#215", divide = "#247", plusmn = "#177",
+    copy = "#169", reg = "#174", trade = "#8482", deg = "#176",
+    laquo = "#171", raquo = "#187", bull = "#8226",
+    prime = "#8242", Prime = "#8243", minus = "#8722",
+    sup2 = "#178", sup3 = "#179", frac12 = "#189",
+    ensp = "#8194", emsp = "#8195", thinsp = "#8201",
+    sect = "#167", para = "#182", euro = "#8364", pound = "#163",
+    yen = "#165", cent = "#162", infin = "#8734", ne = "#8800",
+    le = "#8804", ge = "#8805",
+    larr = "#8592", uarr = "#8593", rarr = "#8594", darr = "#8595", harr = "#8596",
+    hearts = "#9829", spades = "#9824", clubs = "#9827", diams = "#9830",
+    permil = "#8240", lsaquo = "#8249", rsaquo = "#8250",
+}
+
+-- Turn every entity reference into the numeric form MuPDF handles natively and
+-- escape the bare ampersands it would otherwise choke on. Unknown *named*
+-- entities are dropped instead of being left to derail the parser.
+local function normalizeEntities(html)
+    if not html or html == "" then return "" end
+    local kept = {}
+    -- 1. Park every well-formed entity reference so step 2 cannot double-escape it.
+    html = html:gsub("&(%#?[%w]+);", function(name)
+        kept[#kept + 1] = name
+        return "\1" .. #kept .. "\2"
+    end)
+    -- 2. Escape the remaining bare ampersands.
+    html = html:gsub("&", "&amp;")
+    -- 3. Restore: numeric stays numeric, known names become numeric, rest dropped.
+    html = html:gsub("\1(%d+)\2", function(idx)
+        local name = kept[tonumber(idx)]
+        if not name or name == "" then return "" end
+        if name:sub(1, 1) == "#" then
+            return "&" .. name .. ";"
+        end
+        local num = NAMED_ENTITIES[name]
+        if num then
+            return "&" .. num .. ";"
+        end
+        return ""
+    end)
+    return html
+end
+
+-- Reduce one answer body to the minimum markup MuPDF renders safely.
+local function cleanHtmlForRender(html)
+    if not html or html == "" then return "" end
+
+    -- 1. Blocks MuPDF cannot render, or that only duplicate content.
+    html = html:gsub("<!%-%-.-%-%->", "")
+    html = html:gsub("<script[^>]*>.-</script>", "")
+    html = html:gsub("<style[^>]*>.-</style>", "")
+    html = html:gsub("<noscript[^>]*>.-</noscript>", "")
+    html = html:gsub("<iframe[^>]*>.-</iframe>", "")
+    html = html:gsub("<video[^>]*>.-</video>", "")
+    html = html:gsub("<audio[^>]*>.-</audio>", "")
+    -- Inline SVG (LaTeX formulas) renders as garbage in MuPDF: keep a marker.
+    html = html:gsub("<svg[^>]*>.-</svg>", '<span class="omitted">[公式]</span>')
+
+    -- 2. Images: resolve the lazy-load attribute, keep src only.
+    local img_width = getRenderImgWidth()
+    html = html:gsub("<img([^>]*)>", function(attrs)
+        attrs = attrs or ""
+        -- data-original / data-actualsrc / data-src hold the real picture; the
+        -- plain src is often a low-resolution placeholder, which is the second
+        -- reason a picture shows up tiny.
+        local src = attrs:match('data%-original%s*=%s*"([^"]*)"')
+            or attrs:match("data%-original%s*=%s*'([^']*)'")
+            or attrs:match('data%-actualsrc%s*=%s*"([^"]*)"')
+            or attrs:match("data%-actualsrc%s*=%s*'([^']*)'")
+            or attrs:match('data%-src%s*=%s*"([^"]*)"')
+            or attrs:match("data%-src%s*=%s*'([^']*)'")
+            or attrs:match('src%s*=%s*"([^"]*)"')
+            or attrs:match("src%s*=%s*'([^']*)'")
+        if not src or src == "" then
+            return '<span class="omitted">[图片]</span>'
+        end
+        if src:sub(1, 2) == "//" then src = "https:" .. src end
+        src = src:gsub("&", "&amp;"):gsub('"', "&quot;")
+
+        -- Emoji / stickers are inline glyphs: scaling them to full width would
+        -- be absurd, so they stay at their intrinsic size.
+        local cls = attrs:match('class%s*=%s*"([^"]*)"') or attrs:match("class%s*=%s*'([^']*)'")
+        local declared = attrs:match('data%-rawwidth%s*=%s*"(%d+)"')
+            or attrs:match('width%s*=%s*"(%d+)"')
+        local tiny = false
+        if cls and cls:lower():find("emo") then
+            tiny = true
+        elseif declared and tonumber(declared) and tonumber(declared) <= 160 then
+            tiny = true
+        end
+        if tiny then
+            return '<img src="' .. src .. '" class="tiny-img"/>'
+        end
+        if img_width and img_width > 0 then
+            return '<img src="' .. src .. '" class="full-img" width="' .. tostring(img_width) .. '"/>'
+        end
+        return '<img src="' .. src .. '"/>'
+    end)
+
+    -- 3. Every other tag keeps its name plus its class (the stylesheet needs
+    -- .answer / .voteup / .nav-btn), and loses every other attribute.
+    html = html:gsub("<(%a+)([^>]*)>", function(tag, attrs)
+        attrs = attrs or ""
+        if tag == "img" then
+            local src = attrs:match('src%s*=%s*"([^"]*)"')
+            if not src then return '<span class="omitted">[图片]</span>' end
+            local wpx = attrs:match('width%s*=%s*"(%d+)"')
+            local icls = attrs:match('class%s*=%s*"([^"]*)"')
+            local out = '<img src="' .. src .. '"'
+            if wpx then out = out .. ' width="' .. wpx .. '"' end
+            if icls then out = out .. ' class="' .. icls .. '"' end
+            return out .. '/>'
+        end
+        if tag == "a" then
+            -- v140: anchors must keep their target, otherwise the in-page
+            -- "下一个" / "上一批" links are stripped and cannot be tapped.
+            local href = attrs:match('href%s*=%s*"([^"]*)"') or attrs:match("href%s*=%s*'([^']*)'")
+            if href and href ~= "" then
+                href = href:gsub("&", "&amp;"):gsub('"', "&quot;")
+                return '<a href="' .. href .. '">'
+            end
+            return "<a>"
+        end
+        local class = attrs:match('class%s*=%s*"([^"]*)"') or attrs:match("class%s*=%s*'([^']*)'")
+        if class and class ~= "" then
+            class = class:gsub("&", "&amp;")
+            class = class:gsub('"', "")
+            class = class:gsub("'", "")
+            return "<" .. tag .. ' class="' .. class .. '">'
+        end
+        return "<" .. tag .. ">"
+    end)
+
+    -- 4. XHTML-legal empty tags.
+    html = html:gsub("<br>", "<br/>")
+    html = html:gsub("<hr>", "<hr/>")
+
+    -- 5. Drop empty containers: each one still costs a layout box.
+    for _ = 1, 3 do
+        html = html:gsub("<p%s*></p>", "")
+        html = html:gsub("<div%s*></div>", "")
+        html = html:gsub("<span%s*></span>", "")
+        html = html:gsub("<blockquote%s*></blockquote>", "")
+        html = html:gsub("<li%s*></li>", "")
+    end
+
+    -- 6. Collapse whitespace runs left over from the source indentation.
+    html = html:gsub("[\r\n\t]+", " ")
+    html = html:gsub("  +", " ")
+
+    -- 7. Final entity pass (also fixes ampersands inside src URLs).
+    html = normalizeEntities(html)
+
+    return html
+end
+
 -- Extract js-initialData JSON from a Zhihu HTML page
 local function extractInitialData(html)
     if not html or html == "" then return nil end
@@ -345,6 +569,9 @@ function ZhihuClient:new()
     o.cookie_jar = CookieJar:new()
     o.cookie_file = nil
     o.last_error = ""
+    -- v151: main.lua sets this from the "answerer avatar" setting before it
+    -- asks for a page; the rendered HTML then carries <img class="avatar">.
+    o.show_avatar = false
     return o
 end
 
@@ -867,18 +1094,25 @@ function ZhihuClient:_getAnswersViaPage(question_id, title, show_images)
     if answers and type(answers) == "table" then
         for _, ans in pairs(answers) do
             local author_name = "Anonymous"
+            -- v151: keep the avatar next to the name when the payload has one
+            local author_avatar = nil
             if ans.author then
                 if type(ans.author) == "table" then
                     author_name = ans.author.name or "Anonymous"
+                    author_avatar = ans.author.avatarUrl or ans.author.avatar_url
+                        or ans.author.avatarUrlTemplate or ans.author.avatar_url_template
                 elseif type(ans.author) == "string" and entities.users then
                     local uid = ans.author:match("(%d+)")
                     if uid and entities.users[uid] then
                         author_name = entities.users[uid].name or "Anonymous"
+                        author_avatar = entities.users[uid].avatarUrl
+                            or entities.users[uid].avatar_url
                     end
                 end
             end
             table.insert(answer_list, {
                 author_name  = author_name,
+                author_avatar = author_avatar,
                 voteup_count = ans.voteupCount or ans.voteup_count or 0,
                 content      = ans.content or "",
             })
@@ -890,8 +1124,8 @@ function ZhihuClient:_getAnswersViaPage(question_id, title, show_images)
         return (a.voteup_count or 0) > (b.voteup_count or 0)
     end)
 
-    if #answer_list > 15 then
-        for i = #answer_list, 16, -1 do answer_list[i] = nil end
+    if #answer_list > DEFAULT_PAGE_SIZE then
+        for i = #answer_list, DEFAULT_PAGE_SIZE + 1, -1 do answer_list[i] = nil end
     end
 
     if #answer_list == 0 then
@@ -916,7 +1150,7 @@ function ZhihuClient:_getAnswersViaPage(question_id, title, show_images)
     local formatted = {}
     for _, ans in ipairs(answer_list) do
         table.insert(formatted, {
-            author = { name = ans.author_name },
+            author = { name = ans.author_name, avatar_url = ans.author_avatar },
             voteup_count = ans.voteup_count,
             content = ans.content,
         })
@@ -1044,11 +1278,48 @@ end
 -- EPUB Content (HTML format for ebook generation)
 -- =========================================================================
 
-function ZhihuClient:_formatAnswersHtml(answers, title)
+-- v151: the answerer's avatar URL, whichever shape the payload uses. Zhihu
+-- ships a template ("..._{size}.jpg") for its members and plain URLs in the
+-- page payload; both are handled here. Returns nil when none is present.
+local function answerAvatarUrl(answer)
+    if type(answer) ~= "table" then return nil end
+    local u = answer.avatar_url or answer.avatarUrl
+    if type(u) ~= "string" or u == "" then
+        local a = answer.author
+        if type(a) == "table" then
+            u = a.avatar_url_template or a.avatarUrlTemplate
+                or a.avatar_url or a.avatarUrl
+            if type(u) ~= "string" or u == "" then
+                local m = a.member
+                if type(m) == "table" then
+                    u = m.avatar_url_template or m.avatarUrlTemplate
+                        or m.avatar_url or m.avatarUrl
+                end
+            end
+        end
+    end
+    if type(u) ~= "string" or u == "" then return nil end
+    -- "m" is ~200px: enough for an e-ink screen after crengine scales it down,
+    -- small enough to stay a few KB.
+    if u:find("{size}", 1, true) then
+        u = u:gsub("{size}", "m")
+    else
+        -- plain URLs often already carry a size suffix (_xl / _l / _r / _b /
+        -- _hd / _is); ask for the small one instead of a full-resolution file
+        u = u:gsub("_(" .. "xl|l|r|hd|b|is" .. ")(%.[%a]+)$", "_m%2")
+    end
+    return u
+end
+
+function ZhihuClient:_formatAnswersHtml(answers, title, opts)
     if not answers or #answers == 0 then return nil end
+    opts = opts or {}
+    -- v151: callers that do not care about the switch just omit it
+    if opts.show_avatar == nil then opts.show_avatar = self.show_avatar and true or false end
+    local start_no = (tonumber(opts.start_no) or 1) - 1
 
     local parts = {}
-    if title then
+    if title and opts.show_title ~= false then
         table.insert(parts, '<h1 class="title">' .. escapeXml(title) .. '</h1>')
     end
 
@@ -1057,55 +1328,249 @@ function ZhihuClient:_formatAnswersHtml(answers, title)
         local voteup = answer.voteup_count or answer.voteupCount or 0
         local content = answer.content or ""
 
-        content = cleanHtmlForEpub(content)
+        content = cleanHtmlForRender(content)
+        -- v140: a single answer can be hundreds of KB; layout cost grows with
+        -- it and paging becomes unusable, so keep the first slice.
+        if #content > MAX_ANSWER_HTML_BYTES then
+            local cut = content:sub(1, MAX_ANSWER_HTML_BYTES)
+            -- never cut inside a tag: drop the trailing partial tag
+            local lt = cut:match(".*()<")
+            if lt and lt > (#cut - 200) then
+                cut = cut:sub(1, lt - 1)
+            end
+            content = cut .. '<p class="omitted">（回答内容过长，已截断显示）</p>'
+        end
         if content == "" then content = '<p>(content not available)</p>' end
 
         local time_str = formatTime(answer.created_time or answer.createdTime)
-        local meta_line = voteup .. " votes"
+        local meta_line = tostring(voteup) .. " votes"
         if time_str ~= "" then
             meta_line = meta_line .. "  ·  " .. time_str
         end
+        -- v140: number answers so the reader knows where a page starts.
+        local heading = string.format("#%d  %s", start_no + i, author)
 
-        table.insert(parts, string.format(
-            '<div class="answer"><h2 class="author">%s</h2><p class="voteup">%s</p>%s</div>',
-            escapeXml(author), meta_line, content
-        ))
+        local avatar = nil
+        if opts.show_avatar then avatar = answerAvatarUrl(answer) end
+
+        if avatar then
+            -- v151: the avatar rides inside the heading, so it always sits
+            -- next to the name it belongs to and never takes a line of its own.
+            table.insert(parts, string.format(
+                '<div class="answer"><h2 class="author"><img class="avatar" src="%s"/>%s</h2><p class="voteup">%s</p>%s</div>',
+                escapeXml(avatar), escapeXml(heading), meta_line, content
+            ))
+        else
+            table.insert(parts, string.format(
+                '<div class="answer"><h2 class="author">%s</h2><p class="voteup">%s</p>%s</div>',
+                escapeXml(heading), meta_line, content
+            ))
+        end
     end
 
     return table.concat(parts, '\n')
 end
 
-function ZhihuClient:getAnswersHtml(question_id, title, item_type)
+-- -------------------------------------------------------------------------
+-- v140: paged answer rendering + on-disk page cache
+-- -------------------------------------------------------------------------
+
+function ZhihuClient:setCacheDir(dir)
+    self.cache_dir = dir
+end
+
+function ZhihuClient:setCacheTTL(seconds)
+    self.cache_ttl = tonumber(seconds) or DEFAULT_CACHE_TTL
+end
+
+local function pageCacheName(question_id, offset, limit)
+    return string.format("%s_p%d_n%d.html", tostring(question_id), offset, limit)
+end
+
+-- v151: the page HTML depends on the avatar setting, so a turning on/off
+-- switch must not be served a page rendered with the other value.
+local function pageCacheFile(question_id, offset, limit, show_avatar)
+    local name = pageCacheName(question_id, offset, limit)
+    if show_avatar then name = "av_" .. name end
+    return name
+end
+
+-- First line of a cache file is "timestamp|count|has_more", the rest is HTML.
+function ZhihuClient:readCachedPage(question_id, offset, limit)
+    if not self.cache_dir or not question_id then return nil end
+    local path = self.cache_dir .. "/" .. pageCacheFile(question_id, offset, limit, self.show_avatar)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local header = f:read("*l")
+    if not header then
+        f:close()
+        return nil
+    end
+    local ts, count, has_more = header:match("^(%d+)|(%d+)|(%d+)$")
+    if not ts then
+        f:close()
+        pcall(os.remove, path)
+        return nil
+    end
+    local ttl = self.cache_ttl or DEFAULT_CACHE_TTL
+    if ttl > 0 and (os.time() - tonumber(ts)) > ttl then
+        f:close()
+        pcall(os.remove, path)
+        return nil
+    end
+    local body = f:read("*a")
+    f:close()
+    if not body or body == "" then return nil end
+    return body, {
+        offset = offset,
+        limit = limit,
+        count = tonumber(count) or 0,
+        has_more = (has_more == "1"),
+        from_cache = true,
+    }
+end
+
+function ZhihuClient:writeCachedPage(question_id, offset, limit, body, info)
+    if not self.cache_dir or not question_id or not body or body == "" then
+        return false
+    end
+    info = info or {}
+    local path = self.cache_dir .. "/" .. pageCacheFile(question_id, offset, limit, self.show_avatar)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(string.format("%d|%d|%d\n", os.time(), info.count or 0, info.has_more and 1 or 0))
+    f:write(body)
+    f:close()
+    return true
+end
+
+function ZhihuClient:clearPageCache()
+    if not self.cache_dir then return 0 end
+    local removed = 0
+    local ok, lfs = pcall(require, "lfs")
+    if ok and lfs and lfs.dir then
+        local ok_dir = pcall(function()
+            for entry in lfs.dir(self.cache_dir) do
+                if entry:match("%.html$") then
+                    if os.remove(self.cache_dir .. "/" .. entry) then
+                        removed = removed + 1
+                    end
+                end
+            end
+        end)
+        if ok_dir then return removed end
+    end
+    os.execute("rm -f '" .. self.cache_dir .. "'/*.html 2>/dev/null")
+    return removed
+end
+
+-- Answers API with explicit offset/limit. Returns html, info.
+function ZhihuClient:_getAnswersHtmlApi(question_id, title, offset, limit)
+    local url = "https://www.zhihu.com/api/v4/questions/" .. question_id
+        .. string.format("/answers?limit=%d&offset=%d", limit, offset)
+        .. "&include=data[*].content,voteup_count,created_time,author"
+    local qurl = "https://www.zhihu.com/question/" .. question_id
+    local body, code = self:_request(url, "GET", qurl)
+
+    if not body or code ~= 200 then
+        self.last_error = "Answers API HTTP " .. tostring(code or "failed")
+        return nil
+    end
+
+    local data = decodeJSON(body)
+    if not data or not data.data then
+        self.last_error = "No answers in API response"
+        return nil
+    end
+    if #data.data == 0 then
+        self.last_error = "No more answers"
+        return nil
+    end
+
+    -- Trust the paging block when present; otherwise a short page means the end.
+    local has_more
+    if data.paging and data.paging.is_end ~= nil then
+        has_more = not data.paging.is_end
+    else
+        has_more = (#data.data >= limit)
+    end
+
+    local html = self:_formatAnswersHtml(data.data, title, {
+        start_no = offset + 1,
+        show_avatar = self.show_avatar and true or false,
+    })
+    if not html then
+        self.last_error = "Cannot format answers"
+        return nil
+    end
+    return html, {
+        offset = offset,
+        limit = limit,
+        count = #data.data,
+        has_more = has_more,
+        source = "api",
+    }
+end
+
+-- Render one page of answers (5 by default) as HTML.
+-- Returns html, page_info {offset, limit, count, has_more, from_cache}; or nil, error.
+function ZhihuClient:getAnswersPage(question_id, title, item_type, offset, limit)
     if not question_id or question_id == "" then
         return nil, "No question ID"
     end
     question_id = tostring(question_id):match("(%d+)") or question_id
     item_type = item_type or "answer"
+    offset = tonumber(offset) or 0
+    limit = tonumber(limit) or DEFAULT_PAGE_SIZE
+
+    if item_type == "article" then
+        local html, err = self:_getArticleHtml(question_id, title)
+        if not html then return nil, err end
+        return html, { offset = 0, limit = 1, count = 1, has_more = false, source = "article" }
+    end
+
+    -- Cache first: re-opening a page (or hopping back to it) is instant.
+    local cached_html, cached_info = self:readCachedPage(question_id, offset, limit)
+    if cached_html then
+        return cached_html, cached_info
+    end
 
     if not self.cookie_jar:get("d_c0") then
         self:getInitialCookies()
     end
 
-    if item_type == "article" then
-        return self:_getArticleHtml(question_id, title)
-    end
-
-    -- Strategy 1: Answers API
-    local url = "https://www.zhihu.com/api/v4/questions/" .. question_id
-        .. "/answers?limit=5&offset=0&include=data[*].content,voteup_count,created_time,author"
-    local qurl = "https://www.zhihu.com/question/" .. question_id
-    local body, code = self:_request(url, "GET", qurl)
-
-    if body and code == 200 then
-        local data = decodeJSON(body)
-        if data and data.data and #data.data > 0 then
-            return self:_formatAnswersHtml(data.data, title)
+    local html, info = self:_getAnswersHtmlApi(question_id, title, offset, limit)
+    if not html then
+        if offset > 0 then
+            -- The HTML fallback cannot paginate, so a later batch simply does
+            -- not exist there; report the real reason instead of retrying.
+            if self.last_error == "" then self.last_error = "No more answers" end
+            return nil, self.last_error
         end
+        logger.info("[Zhihu] API failed, trying HTML page for:", question_id)
+        html, info = self:_getAnswersHtmlViaPage(question_id, title)
+    end
+    if not html then
+        return nil, self.last_error
     end
 
-    -- Strategy 2: HTML page fallback
-    logger.info("[Zhihu] API failed for EPUB, trying HTML page for:", question_id)
-    return self:_getAnswersHtmlViaPage(question_id, title)
+    info = info or {}
+    info.offset = offset
+    info.limit = limit
+    self:writeCachedPage(question_id, offset, limit, html, info)
+    return html, info
+end
+
+-- Kept for callers that only need the first page (EPUB export, old paths).
+function ZhihuClient:getAnswersHtml(question_id, title, item_type)
+    -- v151: exports stay in the plain layout. An avatar in the exported HTML
+    -- would be a live zhihu.com URL, i.e. a remote fetch inside the file that
+    -- is supposed to be self-contained (and unreadable once offline).
+    local saved = self.show_avatar
+    self.show_avatar = false
+    local html, info = self:getAnswersPage(question_id, title, item_type, 0, DEFAULT_PAGE_SIZE)
+    self.show_avatar = saved
+    return html, info
 end
 
 function ZhihuClient:_getAnswersHtmlViaPage(question_id, title)
@@ -1147,18 +1612,24 @@ function ZhihuClient:_getAnswersHtmlViaPage(question_id, title)
     if answers and type(answers) == "table" then
         for _, ans in pairs(answers) do
             local author_name = "Anonymous"
+            -- v151: keep the avatar next to the name when the payload has one
+            local author_avatar = nil
             if ans.author then
                 if type(ans.author) == "table" then
                     author_name = ans.author.name or "Anonymous"
+                    author_avatar = ans.author.avatarUrl or ans.author.avatar_url
+                        or ans.author.avatarUrlTemplate or ans.author.avatar_url_template
                 elseif type(ans.author) == "string" and entities.users then
                     local uid = ans.author:match("(%d+)")
                     if uid and entities.users[uid] then
                         author_name = entities.users[uid].name or "Anonymous"
+                        author_avatar = entities.users[uid].avatarUrl
+                            or entities.users[uid].avatar_url
                     end
                 end
             end
             table.insert(answer_list, {
-                author = { name = author_name },
+                author = { name = author_name, avatar_url = author_avatar },
                 voteup_count = ans.voteupCount or ans.voteup_count or 0,
                 content = ans.content or "",
             })
@@ -1169,8 +1640,8 @@ function ZhihuClient:_getAnswersHtmlViaPage(question_id, title)
         return (a.voteup_count or 0) > (b.voteup_count or 0)
     end)
 
-    if #answer_list > 15 then
-        for i = #answer_list, 16, -1 do answer_list[i] = nil end
+    if #answer_list > DEFAULT_PAGE_SIZE then
+        for i = #answer_list, DEFAULT_PAGE_SIZE + 1, -1 do answer_list[i] = nil end
     end
 
     if #answer_list == 0 then
