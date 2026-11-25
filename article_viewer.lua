@@ -39,6 +39,17 @@ local T = require("ffi/util").template
 -- v131: height reserved for the bottom status line
 local STATUS_HEIGHT = Screen:scaleBySize(28)
 
+-- v154: refresh strategy defaults (the live values come from the plugin
+-- settings, see Zhihu:getRefreshMode()); these are only the fallbacks used
+-- when the viewer runs without a plugin reference.
+local DEFAULT_REFRESH_MODE = "regal"
+local PARTIAL_BEFORE_FULL = 6
+-- v154: once every picture of the batch is on disk, wait for the reader to
+-- turn a page. If he just sits there, paint them anyway after this many
+-- seconds, so a dead-end page can never swallow the pictures for good.
+local IMAGE_IDLE_REFRESH_DELAY = 8
+
+
 -- v147: the <img> metadata is not trustworthy (Zhihu tags plenty of real
 -- photographs with data-rawwidth <= 160, and several answers ship no width at
 -- all), so the painted size must come from the bitmap that actually landed on
@@ -125,6 +136,11 @@ local ArticleViewer = InputContainer:extend{
     _page_text = "",       -- "12/34" page indicator
     _status_shown = nil,   -- text currently on screen
     _status_page = nil,    -- page number when the status was last painted
+    -- v154: picture pipeline state. Nothing is painted while _images_ready is
+    -- false; the single pass is recorded by _images_applied so it can never run
+    -- twice for one batch.
+    _images_ready = false,
+    _images_applied = false,
 }
 
 -- v140: human readable nav target, used for both the status bar button and
@@ -235,6 +251,54 @@ function ArticleViewer:_paintStatusOnPageChange()
     end
 end
 
+-- v154: settings-driven refresh strategy --------------------------------
+-- UIManager refresh types we can ask for:
+--   "full"          flashing, highest quality, ~1s on a Kindle
+--   "partial"       fast, ghosting builds up over pages
+--   "flashpartial"  flashing partial — and on REAGL / Regal panels the driver
+--                   turns exactly this into a Regal update, i.e. high quality
+--                   WITHOUT the black flash (see UIManager's own docs)
+function ArticleViewer:_getRefreshMode()
+    local mode
+    local plugin = self.plugin
+    if plugin and plugin.getRefreshMode then
+        local ok, v = pcall(function() return plugin:getRefreshMode() end)
+        if ok then mode = v end
+    end
+    if mode ~= "full" and mode ~= "partial" and mode ~= "partial_n" and mode ~= "regal" then
+        mode = DEFAULT_REFRESH_MODE
+    end
+    return mode
+end
+
+-- kind = "partial" for a routine repaint (page turn), "full" when the screen
+-- content changes wholesale (the picture pass).
+function ArticleViewer:_refreshType(kind)
+    local mode = self:_getRefreshMode()
+    if mode == "full" then
+        return "full"
+    elseif mode == "partial" then
+        return "partial"
+    elseif mode == "partial_n" then
+        if kind == "full" then
+            self._partial_since_full = 0
+            return "full"
+        end
+        self._partial_since_full = (self._partial_since_full or 0) + 1
+        if self._partial_since_full >= PARTIAL_BEFORE_FULL then
+            self._partial_since_full = 0
+            return "full"
+        end
+        return "partial"
+    end
+    -- "regal": a panel without REAGL support simply does a flashing partial,
+    -- which is still cheaper than a full refresh and never leaves ghosting.
+    if Screen and type(Screen.refreshFlashPartial) == "function" then
+        return "flashpartial"
+    end
+    return "partial"
+end
+
 function ArticleViewer:init()
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
@@ -300,8 +364,11 @@ function ArticleViewer:init()
         -- paging was deliberately not swapped in (a relayout mid-turn looks
         -- like a stutter); do it now that the turn is over. No-op when the page
         -- on screen is already up to date.
+        -- v154: this is also the only moment the freshly downloaded pictures
+        -- are painted: the relayout and the page-turn repaint share one single
+        -- refresh (the type comes from the "Refresh Mode" setting).
         if self._applyPendingImages then pcall(self._applyPendingImages) end
-        UIManager:setDirty(self, "full")
+        UIManager:setDirty(self, self:_refreshType("partial"))
         -- v131: refresh the bottom progress line only when we page
         self:_paintStatusOnPageChange()
         return result
@@ -320,7 +387,9 @@ function ArticleViewer:init()
         local before = html_widget.htmlbox_widget.page_number
         local res = orig_onTapScrollText(html_widget, arg, ges)
         if res then
-            UIManager:setDirty(self, "full")
+            -- v154: a tapped page turn paints the downloaded pictures too
+            if self._applyPendingImages then pcall(self._applyPendingImages) end
+            UIManager:setDirty(self, self:_refreshType("partial"))
             self:_paintStatusOnPageChange()
             return res
         end
@@ -431,8 +500,10 @@ function ArticleViewer:onShow()
     -- v122: Background download with in-place setContent refresh
     if self.pending_urls and #self.pending_urls > 0 and self.plugin then
         self._downloading = true
-        -- v143: fresh throttle state for this viewing session
-        self._refresh_pending = nil
+        -- v154: the single picture pass has not happened yet, and the batch is
+        -- not complete (nothing may be painted before it is)
+        self._images_applied = false
+        self._images_ready = false
         -- v146: the html currently on screen (starts as the placeholder version)
         self._applied_html = nil
         local client = self.plugin.client
@@ -674,24 +745,23 @@ function ArticleViewer:onShow()
             return html
         end
 
-        local function applyImages(final)
-            if self._closed then return end
-            -- cheap guard: nothing new landed since the last pass
-            if not final and (self._applied_count or -1) == downloaded_count then
-                return
-            end
-            self._applied_count = downloaded_count
+        -- v154: ONE pass, and only once every picture of the batch is on disk.
+        -- The old code ran this for every single downloaded picture, which
+        -- relaid out the whole document and repainted the screen once per
+        -- image ("下一个图就刷一次"). Now it runs on the next page turn (see the
+        -- hooks above) or after the idle fallback, whichever comes first.
+        local function applyImages()
+            if self._closed or self._images_applied then return end
+            self._images_applied = true
             local new_html = buildHtml()
-            if final then
-                -- whatever is still remote by now is a failed download
-                new_html = new_html:gsub('<img([^>]*)>', function(attrs)
-                    local url = attrs:match('src="([^"]*)"')
-                    if url and url:match("^https?://") then
-                        return '<div class="img-placeholder"><span class="img-num">[图片]</span></div>'
-                    end
-                    return nil
-                end)
-            end
+            -- whatever is still remote by now is a failed download
+            new_html = new_html:gsub('<img([^>]*)>', function(attrs)
+                local url = attrs:match('src="([^"]*)"')
+                if url and url:match("^https?://") then
+                    return '<div class="img-placeholder"><span class="img-num">[图片]</span></div>'
+                end
+                return nil
+            end)
 
             -- nothing on disk changed since the last paint: do not touch the
             -- screen at all (this is what keeps page turns uninterrupted)
@@ -732,47 +802,23 @@ function ArticleViewer:onShow()
             -- setDirty aimed at it is silently dropped and the new layout never
             -- reaches the screen. Dirty the viewer itself, and the inner dialog
             -- as a belt-and-braces measure.
-            -- v146: an intermediate pass uses "partial". A "full" e-ink refresh
-            -- takes around a second on a Kindle, so back-to-back full refreshes
-            -- get merged by the driver and the reader only ever sees one jump at
-            -- the end — exactly the "all pictures appear at once" symptom. A
-            -- partial refresh is what an in-place picture swap wants; the last
-            -- pass still asks for a full one to clean up the ghosting.
-            local mode = final and "full" or "partial"
+            -- v154: the refresh type now comes from the "Refresh Mode"
+            -- setting ("full" / "partial" / "partial_n" / "regal"). For
+            -- "partial_n" this pass counts as the full one that clears the
+            -- ghosting built up by the page turns before it.
+            local mode = self:_refreshType("full")
             UIManager:setDirty(self, mode)
             local dlg = self.html_widget and self.html_widget.dialog
             if dlg then UIManager:setDirty(dlg, mode) end
         end
 
-        -- v146: exposed for the page-turn hooks above, so a swap that was held
-        -- back during navigation happens as soon as the turn finishes
-        self._applyPendingImages = function() applyImages(false) end
-
-        local function scheduleImageRefresh()
+        -- v154: exposed for the page-turn hooks above. Pictures still coming in
+        -- leave the screen alone; once the whole batch is on disk, the very
+        -- next page turn paints all of them with a single refresh.
+        self._applyPendingImages = function()
             if self._closed then return end
-            -- one relayout per landed picture; a picture that finishes while a
-            -- refresh is already on its way rides along with it
-            if self._refresh_pending then return end
-            self._refresh_pending = true
-            local tries = 0
-            local function fire()
-                if self._closed then
-                    self._refresh_pending = false
-                    return
-                end
-                tries = tries + 1
-                -- do not hijack the screen while the reader turns a page, but
-                -- never wait forever either (a finished batch is a dead end)
-                if self._navigating and tries < 3 then
-                    UIManager:scheduleIn(0.3, fire)
-                    return
-                end
-                self._refresh_pending = false
-                applyImages(false)
-            end
-            -- short delay: the picture is already on disk, it only has to be
-            -- laid out — anything longer reads as "nothing happens"
-            UIManager:scheduleIn(0.1, fire)
+            if not self._images_ready then return end
+            applyImages()
         end
 
         local function downloadOne(index)
@@ -787,10 +833,18 @@ function ArticleViewer:onShow()
                 end
                 self._downloading = false
                 setProgress(nil)
-                -- v143: last pass — placeholders for the pictures we lost
-                applyImages(true)
+                -- v154: downloading is over, but nothing is repainted here on
+                -- purpose — the pictures are laid out (and the screen refreshed
+                -- exactly once) on the next page turn. If the reader simply
+                -- sits on this page, the idle fallback below paints them anyway
+                -- so a dead-end page can never hide its pictures for good.
+                self._images_ready = true
                 -- v131: download finished — clear the status line and draw it
                 self:_paintStatus()
+                UIManager:scheduleIn(IMAGE_IDLE_REFRESH_DELAY, function()
+                    if self._closed or not self._images_ready then return end
+                    applyImages()
+                end)
                 return
             end
 
@@ -806,9 +860,9 @@ function ArticleViewer:onShow()
                 -- it can be dropped into that very placeholder
                 by_index[item.index or 0] = filename
                 downloaded_count = downloaded_count + 1
-                -- this picture is on disk — put it on the page right away,
-                -- no matter how many pictures are still queued behind it
-                scheduleImageRefresh()
+                -- v154: deliberately NO refresh here. One picture landing is
+                -- not worth a screen update; the batch is painted in one go on
+                -- the next page turn (or by the idle fallback).
             end
 
             -- v131: only repaint if the reader has turned a page meanwhile

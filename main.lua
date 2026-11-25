@@ -1,5 +1,5 @@
 --[[
-    Zhihu Reader Plugin for KOReader v153
+    Zhihu Reader Plugin for KOReader v154
     - QR code login: auto-completing poll login
     - Risk-control (unhuman) verification flow for blocked networks (Android)
     - Recommended feed (12 items per batch) with Load More cursor
@@ -13,6 +13,10 @@
       centred as inline content, so they no longer lean to the right
     - v151: optional answerer avatar next to each author name (off by default)
     - v153: every settings label is bilingual (Chinese / English)
+    - v154: new "Refresh Mode" setting: full / partial / partial x N then full /
+      Regal (default Regal). Article pictures are no longer repainted one by
+      one: once the whole batch is on disk the next page turn paints them all
+      in a single refresh.
 - v152: that avatar is sized 4x the body font (~88px at font 22), still
       capped at 14% of the screen so it never crowds the author line
     - Export to HTML & EPUB with auto-open
@@ -488,6 +492,32 @@ function Zhihu:buildMenuItems()
              callback = function()
                  self.settings:saveSetting("image_page_break", true)
                  self.updated = true
+             end},
+        },
+    })
+
+    table.insert(sub_items, {
+        text = _("刷新模式 (Refresh Mode)"),
+        sub_item_table = {
+            {text = _("全刷 (Full Refresh)"),
+             checked_func = function() return self:getRefreshMode() == "full" end,
+             callback = function()
+                 self:setRefreshMode("full")
+             end},
+            {text = _("局刷 (Partial Refresh)"),
+             checked_func = function() return self:getRefreshMode() == "partial" end,
+             callback = function()
+                 self:setRefreshMode("partial")
+             end},
+            {text = T(_("局部刷新 %1 次后全刷 (Partial x %1, then Full)"), REFRESH_PARTIAL_COUNT),
+             checked_func = function() return self:getRefreshMode() == "partial_n" end,
+             callback = function()
+                 self:setRefreshMode("partial_n")
+             end},
+            {text = _("Regal 刷新 (Regal, Default)"),
+             checked_func = function() return self:getRefreshMode() == "regal" end,
+             callback = function()
+                 self:setRefreshMode("regal")
              end},
         },
     })
@@ -1313,6 +1343,34 @@ end
 -- v148: should a content picture start on a page of its own?
 function Zhihu:getImagePageBreak()
     return self.settings:readSetting("image_page_break", DEFAULT_IMAGE_PAGE_BREAK) == true
+end
+
+-- v154: which e-ink refresh strategy the article viewer uses
+-- ("full" / "partial" / "partial_n" / "regal", default "regal").
+function Zhihu:getRefreshMode()
+    local v = self.settings:readSetting("refresh_mode", DEFAULT_REFRESH_MODE)
+    if v == "full" or v == "partial" or v == "partial_n" or v == "regal" then
+        return v
+    end
+    return DEFAULT_REFRESH_MODE
+end
+
+function Zhihu:setRefreshMode(mode)
+    if mode ~= "full" and mode ~= "partial" and mode ~= "partial_n" and mode ~= "regal" then
+        mode = DEFAULT_REFRESH_MODE
+    end
+    self.settings:saveSetting("refresh_mode", mode)
+    self.updated = true
+    local labels = {
+        full = _("Full refresh"),
+        partial = _("Partial refresh"),
+        partial_n = T(_("Partial x %1, then full"), REFRESH_PARTIAL_COUNT),
+        regal = _("Regal refresh"),
+    }
+    UIManager:show(InfoMessage:new{
+        text = T(_("Refresh mode: %1"), labels[mode] or mode),
+        timeout = 2,
+    })
 end
 
 -- v146: first-line indent of a paragraph, in characters (0 or 2).
