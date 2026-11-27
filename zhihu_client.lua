@@ -827,10 +827,12 @@ end
 -- Recommend Feed
 -- =========================================================================
 
-function ZhihuClient:getRecommendFeed(start_url, max_pages)
+function ZhihuClient:getRecommendFeed(start_url, max_pages, max_items)
     max_pages = max_pages or 3
-    -- v127: the Recommended Feed list shows 12 items per batch
-    local max_items = 12
+    -- v127: the Recommended Feed list showed a fixed 12 items per batch.
+    -- v159: the batch size comes from the caller (multiple of 6, 12 if unset).
+    max_items = math.floor(tonumber(max_items) or 12)
+    if max_items < 1 then max_items = 12 end
     if not self:isLoggedIn() then return nil, "Not logged in" end
 
     local base_url = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=20&desktop=true"
@@ -905,7 +907,7 @@ function ZhihuClient:getRecommendFeed(start_url, max_pages)
         -- Follow cursor pagination (zhihu returns paging.next + paging.is_end).
         -- The cursor is always advanced BEFORE the item-count check, so
         -- "Load More" continues from the true next page even when we stop
-        -- early after reaching the 12-item cap.
+        -- early after reaching the batch cap.
         if data.paging and data.paging.next and not data.paging.is_end then
             next_url = data.paging.next
             url = data.paging.next

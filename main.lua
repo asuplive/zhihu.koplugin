@@ -1,8 +1,9 @@
 --[[
-    Zhihu Reader Plugin for KOReader v154
+    Zhihu Reader Plugin for KOReader v160
     - QR code login: auto-completing poll login
     - Risk-control (unhuman) verification flow for blocked networks (Android)
-    - Recommended feed (12 items per batch) with Load More cursor
+    - Recommended feed (batch size configurable: 6/12/18/24/30/36) with Load
+      More cursor
     - ArticleViewer with ScrollHtmlWidget for reading (native page turn)
     - All article images load, auto-downscaled to screen width (e-ink safe)
     - Per-article image cache: each image is downloaded once, stored in
@@ -17,6 +18,52 @@
       Regal (default Regal). Article pictures are no longer repainted one by
       one: once the whole batch is on disk the next page turn paints them all
       in a single refresh.
+    - v155: the Font Family setting now really reaches what is on screen.
+      The feed list (a plain KOReader Menu) is painted with the chosen face
+      instead of the menu default, article HTML gets the chosen family plus
+      file-name aliases derived from the installed font files, and a local
+      @font-face rule points MuPDF straight at that face. The "font applied"
+      toast also reports which font file was matched, so a name that exists
+      nowhere on the device is visible instead of silently ignored.
+    - v156: the article CSS no longer carries an @font-face rule (MuPDF's HTML
+      engine ignores it, and a rule it cannot parse is one more thing between
+      the setting and the screen). The family list now starts with the font
+      file name exactly as it sits on disk, extension included, because that
+      is the form MuPDF's font lookup actually tries first. New "Font
+      diagnostics" entry prints the resolved face, the file count and the
+      exact CSS the article is laid out with.
+    - v157: the family that reaches the article CSS is now the one that can
+      actually draw Chinese. A Latin-only choice such as "Noto Serif" used to
+      win the name match, so MuPDF drew Latin with it and left every Chinese
+      character on its built-in CJK fallback -- the page looked untouched.
+      Fonts are now tagged with their script coverage, a Latin-only choice is
+      swapped for its CJK sibling ("Noto Serif" -> "Noto Serif CJK SC"), the
+      CSS keeps only a handful of tokens instead of a hundred, and the font
+      menu lists the Chinese fonts the device really has.
+    - v158: v157 shipped a helper (cjkFontFaces) that was called from three
+      places but never defined, so opening the font menu -- and the article
+      view, which builds the same CSS -- raised "attempt to call a nil value"
+      and KOReader went down; the plain text viewer kept working because it
+      uses no custom CSS. The helper is now defined, font names are taken from
+      the real family (not the PostScript name or the file name), a name that
+      says Chinese (NotoSansCJK, DroidSansFallback, wqy-*) counts as Chinese
+      even when the font metadata does not say so, and the installed font
+      lookup survives a fontlist that is missing or throws.
+    - v159: new "Feed Batch Size" setting. The recommended feed used to stop at
+      a hard-coded 12 items; the batch is now whatever multiple of 6 the user
+      picks (6 / 12 / 18 / 24 / 30 / 36, default 12). The client keeps
+      accumulating API pages until the chosen size is reached, so a bigger
+      batch means deeper pagination behind the same "Load More" cursor.
+    - v160: the Zhihu menu is regrouped. The top level now holds only what is
+      used while reading (user name, Recommended Feed, login/logout) plus four
+      grouped submenus -- Reading, Layout & Refresh, Cache & Export, and
+      Settings. Everything that changes how the page looks sits under Reading
+      or Layout & Refresh; clearing caches and exporting sit together; feed
+      batch size, a "Current Settings" summary (every value in one screen) and
+      the About page sit under Settings, with About last. The About text was
+      rewritten into short grouped lines (what it does / how to use it / where
+      data lives) instead of one long feature list, and the version string now
+      comes from a single PLUGIN_VERSION constant.
 - v152: that avatar is sized 4x the body font (~88px at font 22), still
       capped at 14% of the screen so it never crowds the author line
     - Export to HTML & EPUB with auto-open
@@ -45,6 +92,9 @@ local T               = require("ffi/util").template
 local Device          = require("device")
 local Screen          = Device.screen
 local logger          = require("logger")
+
+-- single source of truth for the version shown in About / Settings summary
+local PLUGIN_VERSION  = "v160"
 
 -- QR login: Trapper + ImageViewer (v7 proven stable on Android)
 local Trapper       = require("ui/trapper")
@@ -94,8 +144,22 @@ local QR_MAX_POLLS = 40
 
 -- v140: answers per page (fetch + render unit).
 local DEFAULT_PAGE_SIZE = 5
+-- v159: recommended-feed batch size. Only multiples of 6 are allowed (the
+-- feed list is laid out in rows of six cards per screen-worth of scrolling);
+-- 12 keeps the pre-v159 behaviour.
+local DEFAULT_FEED_BATCH = 12
+local FEED_BATCH_STEP = 6
+local FEED_BATCH_MIN = 6
+local FEED_BATCH_MAX = 36
 -- v140: an answer page stays cached on disk for this long (seconds).
 local DEFAULT_CACHE_TTL = 3600
+
+-- v160: the refresh-mode entries used to read two constants that were never
+-- declared, so the "partial x N" label printed "Partial x nil" and no entry
+-- was ticked on a fresh install. Keep N in step with PARTIAL_BEFORE_FULL in
+-- article_viewer.lua.
+local DEFAULT_REFRESH_MODE = "regal"
+local REFRESH_PARTIAL_COUNT = 6
 
 -- v130: ALL images are loaded (the v129 count/size caps were removed per
 -- user requirement). Freeze protection now comes from downscaling instead:
@@ -118,29 +182,33 @@ local DEFAULT_CJK_FONT_STACK = '"Noto Serif CJK SC", "WenQuanYi Micro Hei", "Dro
 
 -- Family names that are commonly present on e-ink readers, Android and
 -- desktop, plus the generic CSS families.
+-- v157: entries are { name = family, latin_only = true }. A Latin-only family
+-- ("Noto Serif") cannot draw a single Chinese character, so the menu says so
+-- instead of letting the choice look broken; the CJK families come first.
 local FONT_PRESETS = {
-    "Noto Serif CJK SC",
-    "Noto Sans CJK SC",
-    "Source Han Serif SC",
-    "Source Han Sans SC",
-    "Noto Serif",
-    "Noto Sans",
-    "Droid Sans Fallback",
-    "WenQuanYi Micro Hei",
-    "WenQuanYi Zen Hei",
-    "Songti SC",
-    "STSong",
-    "STKaiti",
-    "Heiti SC",
-    "STHeiti",
-    "SimSun",
-    "SimHei",
-    "KaiTi",
-    "Microsoft YaHei",
-    "PingFang SC",
-    "serif",
-    "sans-serif",
-    "monospace",
+    { name = "Noto Serif CJK SC" },
+    { name = "Noto Sans CJK SC" },
+    { name = "Source Han Serif SC" },
+    { name = "Source Han Sans SC" },
+    { name = "Droid Sans Fallback" },
+    { name = "WenQuanYi Micro Hei" },
+    { name = "WenQuanYi Zen Hei" },
+    { name = "Songti SC" },
+    { name = "STSong" },
+    { name = "STKaiti" },
+    { name = "Heiti SC" },
+    { name = "STHeiti" },
+    { name = "SimSun" },
+    { name = "SimHei" },
+    { name = "KaiTi" },
+    { name = "Microsoft YaHei" },
+    { name = "PingFang SC" },
+    { name = "Noto Serif", latin_only = true },
+    { name = "Noto Sans", latin_only = true },
+    -- generic families are left unmarked: the device decides what they map to
+    { name = "serif" },
+    { name = "sans-serif" },
+    { name = "monospace" },
 }
 
 -- Turn a stored font name into a CSS font-family token. Generic families must
@@ -156,6 +224,447 @@ local function cssFontFamily(name)
     end
     return '"' .. n:gsub('"', "") .. '"'
 end
+
+-- v155: article HTML is laid out by MuPDF, which resolves a CSS family name
+-- against the font files the device actually ships. A family name such as
+-- "Noto Serif CJK SC" almost never equals the file name it lives in
+-- ("NotoSansCJK-Regular.ttc"), so on many devices the chosen family silently
+-- fell back to the default stack and the setting looked like it did nothing.
+-- Derive a few extra aliases from the installed font files: the name without
+-- spaces, and every font file whose name matches the family.
+local FONT_GENERIC_FAMILIES = { serif = true, ["sans-serif"] = true,
+    monospace = true, cursive = true, fantasy = true }
+
+-- v156: the private "ZhihuUserFont" family and its @font-face rule are gone.
+-- MuPDF lays out the article HTML and it does not implement @font-face, so the
+-- rule never bound a face; all it could do was sit in the stylesheet as one
+-- more declaration for the parser to walk past. A real family name that MuPDF
+-- can resolve is the only thing that changes the glyphs.
+
+local function fontKey(s)
+    return (tostring(s):lower():gsub("%.[%w]+$", ""):gsub("[%s%-_]", ""))
+end
+
+local function plainName(s)
+    return (tostring(s):gsub('"', ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function baseName(path)
+    return tostring(path):match("([^/\\]+)$") or tostring(path)
+end
+
+-- "./fonts/x.ttf" is relative to the KOReader data directory; MuPDF needs a
+-- path it can open on its own.
+local function absoluteFontPath(path)
+    local p = tostring(path)
+    if p:sub(1, 2) == "./" then
+        local ok, DataStorage = pcall(require, "datastorage")
+        if not ok or not DataStorage then return nil end
+        local dir = DataStorage:getDataDir()
+        if not dir then return nil end
+        return dir .. "/" .. p:sub(3)
+    end
+    if p:sub(1, 1) == "/" then return p end
+    return nil
+end
+
+-- A face carries several names: the file name, the family and the full name.
+-- Only the last two are things a user types, so never take a style token such
+-- as "Regular" on its own. OpenType name ids are numeric and identical across
+-- platforms: 1 = family, 4 = full name.
+local HB_NAME_FAMILY = 1
+local HB_NAME_FULL = 4
+
+local function faceNameTokens(face, out)
+    local function add(v)
+        if type(v) == "string" and v ~= "" then table.insert(out, v) end
+    end
+    if type(face) ~= "table" then return out end
+    add(face.name)
+    local names = face.names
+    if type(names) ~= "table" then return out end
+    for _lang, byid in pairs(names) do
+        if type(byid) == "table" then
+            add(byid[HB_NAME_FAMILY])
+            add(byid[HB_NAME_FULL])
+        elseif type(byid) == "string" then
+            add(byid)
+        end
+    end
+    return out
+end
+
+-- v157: can this face draw Chinese at all? "Noto Serif" is a Latin-only face:
+-- pick it and MuPDF draws the Latin with it, but every Chinese character falls
+-- back to the engine's built-in CJK face, so the article looks exactly as it
+-- did before. fontlist keeps the script/language coverage HarfBuzz reports for
+-- each face; the shape of those tables differs between versions, so they are
+-- read defensively and nil means "cannot judge".
+local CJK_SCRIPT_TAGS = { hani = true, hans = true, hant = true, jpan = true,
+    kore = true, zh = true, ja = true, ko = true }
+
+local function tagHasCJK(tag)
+    if type(tag) ~= "string" then return false end
+    tag = tag:lower()
+    if CJK_SCRIPT_TAGS[tag] then return true end
+    return tag:match("^zh") ~= nil
+end
+
+local function coverageHasCJK(t)
+    if type(t) ~= "table" then return nil end
+    local recognised = false
+    for k, v in pairs(t) do
+        if type(k) == "string" or type(v) == "string" then recognised = true end
+        if tagHasCJK(k) or tagHasCJK(v) then return true end
+    end
+    if not recognised then return nil end
+    return false
+end
+
+local function faceHasCJK(face)
+    if type(face) ~= "table" then return nil end
+    if type(face.scripts) == "table" and next(face.scripts) ~= nil then
+        return coverageHasCJK(face.scripts)
+    end
+    if type(face.langs) == "table" and next(face.langs) ~= nil then
+        return coverageHasCJK(face.langs)
+    end
+    return nil
+end
+
+-- v158: not every KOReader build keeps script coverage in fontlist.fontinfo, so
+-- a name that announces Chinese (NotoSansCJK, DroidSansFallback, wqy-microhei,
+-- SimSun ...) is treated as Chinese-capable when the metadata says nothing.
+-- Returns nil when the name gives no clue at all: unknown is not "Latin only".
+local CJK_NAME_HINTS = { "cjk", "fallback", "hei", "song", "ming", "kai",
+    "wqy", "wenquanyi", "yahei", "pingfang", "fangsong", "yuanti", "simsun",
+    "simhei", "sourcehan", "notosanssc", "notoserifsc", "notosansmonosc" }
+
+local function nameLooksCJK(name)
+    local key = fontKey(plainName(name))
+    if key == "" then return nil end
+    for _i, hint in ipairs(CJK_NAME_HINTS) do
+        if key:find(hint, 1, true) then return true end
+    end
+    return nil
+end
+
+-- One entry per (font file, face): the file name, the family name the engine
+-- reports for it, and the normalised keys of both.
+local _font_faces_cache
+local function installedFontFaces()
+    if _font_faces_cache and #_font_faces_cache > 0 then return _font_faces_cache end
+    local ok, FontList = pcall(require, "fontlist")
+    if not ok or not FontList or not FontList.getFontList then return {} end
+    local ok2, list = pcall(FontList.getFontList, FontList)
+    if not ok2 or type(list) ~= "table" then return {} end
+    local info = FontList.fontinfo
+    local faces = {}
+    for _i, path in ipairs(list) do
+        local p = tostring(path)
+        if p ~= "" then
+            local families, seenfam = {}, {}
+            local entries = type(info) == "table" and info[p] or nil
+            -- v157: any face in the file carrying Chinese makes the file usable
+            -- for Chinese text; nil means the metadata could not tell us.
+            local cjk = nil
+            if type(entries) == "table" then
+                local known, hit = false, false
+                for _j, fe in ipairs(entries) do
+                    local r = faceHasCJK(fe)
+                    if r ~= nil then known = true end
+                    if r then hit = true end
+                end
+                if hit then cjk = true elseif known then cjk = false end
+            end
+            if type(entries) == "table" then
+                for _j, face in ipairs(entries) do
+                    for _k, token in ipairs(faceNameTokens(face, {})) do
+                        if not seenfam[token] then
+                            seenfam[token] = true
+                            table.insert(families, token)
+                        end
+                    end
+                end
+            end
+            local base = baseName(p)
+            if #families == 0 then
+                families = { (base:gsub("%.[%w]+$", "")) }
+            end
+            for _j, family in ipairs(families) do
+                -- v158: metadata first, then the names. A file whose family is
+                -- "Noto Serif" but whose file is NotoSerifCJK-Regular.ttc still
+                -- counts as Chinese-capable; a bare "Noto Serif" does not.
+                local file_cjk = cjk
+                if file_cjk == nil then file_cjk = nameLooksCJK(family) end
+                if file_cjk == nil then file_cjk = nameLooksCJK(base) end
+                table.insert(faces, {
+                    base = base,
+                    path = p,
+                    family = family,
+                    key = fontKey(base),
+                    family_key = fontKey(family),
+                    cjk = file_cjk,
+                })
+            end
+        end
+    end
+    _font_faces_cache = faces
+    return faces
+end
+
+-- Every installed face that plausibly answers the requested family, best first.
+-- Family name beats file name, and a regular face beats its bold/italic sibling.
+local function resolveFontCandidates(name)
+    local raw = plainName(name)
+    if raw == "" then return {} end
+    local target = fontKey(raw)
+    if target == "" then return {} end
+    local scored = {}
+    for _i, face in ipairs(installedFontFaces()) do
+        local score
+        if face.family_key == target then
+            score = 5
+        elseif face.key == target then
+            score = 4
+        elseif face.family_key ~= ""
+            and (face.family_key:find(target, 1, true) or target:find(face.family_key, 1, true)) then
+            score = 3
+        elseif face.key ~= ""
+            and (face.key:find(target, 1, true) or target:find(face.key, 1, true)) then
+            score = 2
+        end
+        if score then
+            if face.key:find("bold", 1, true) or face.key:find("italic", 1, true) then
+                score = score - 0.5
+            end
+            table.insert(scored, { face = face, score = score })
+        end
+    end
+    table.sort(scored, function(a, b) return a.score > b.score end)
+    local out, seen = {}, {}
+    for _i, entry in ipairs(scored) do
+        if not seen[entry.face.path] then
+            seen[entry.face.path] = true
+            table.insert(out, entry.face)
+        end
+    end
+    return out
+end
+
+-- v158: a face entry whose "family" is just the file name carries no real
+-- family name (the font shipped no name table). Such an entry is a last resort
+-- for matching, never a label to show the user or to put in the CSS.
+local function faceIsFileNameToken(face)
+    local family, base = face.family, face.base or ""
+    if not family then return true end
+    return family == base or family == (base:gsub("%.[%w]+$", ""))
+end
+
+-- v158: how much a token looks like something a human would recognise as a
+-- family name. fontlist reports the PostScript name ("NotoSerifCJKsc-Regular")
+-- alongside the real family ("Noto Serif CJK SC"); only the latter belongs in
+-- the menu and in the CSS.
+local function familyLabelScore(face)
+    local f = face.family or ""
+    if f == "" or faceIsFileNameToken(face) then return 0 end
+    if f:find("%s") then return 3 end
+    if not f:find("-", 1, true) then return 2 end
+    return 1
+end
+
+-- v157: the CJK sibling of the chosen family ("Noto Serif" -> "Noto Serif CJK
+-- SC"), so a Latin-only choice still ends up changing the Chinese text.
+local function bestCjkFace(name)
+    local target = fontKey(name)
+    if target == "" then return nil end
+    -- v158: prefer a face that reports a real family name; only fall back to
+    -- file-name-only entries when nothing else matches.
+    local best, best_score
+    local best_label
+    local loose
+    local loose_score
+    for _i, face in ipairs(installedFontFaces()) do
+        if face.cjk then
+            local fk = face.family_key or ""
+            local score = 0
+            if fk == target then
+                score = 5
+            elseif fk:sub(1, #target) == target then
+                score = 4
+            elseif fk:find(target, 1, true) then
+                score = 3
+            elseif target:find(fk, 1, true) then
+                score = 2
+            end
+            if score > 0 then
+                if face.key:find("bold", 1, true) or face.key:find("italic", 1, true) then
+                    score = score - 0.5
+                end
+                local label = familyLabelScore(face)
+                if label == 0 then
+                    if not loose_score or score > loose_score then
+                        loose, loose_score = face, score
+                    end
+                elseif not best_score or score > best_score
+                    or (score == best_score and label > best_label) then
+                    best, best_score, best_label = face, score, label
+                end
+            end
+        end
+    end
+    return best or loose
+end
+
+-- v158: every installed face that can really draw Chinese, regular faces first.
+-- v157 called this from three places (article CSS fallback, the font menu and
+-- the diagnostics page) but never defined it, so every call raised
+-- "attempt to call a nil value (global 'cjkFontFaces')" -- which is exactly why
+-- opening the font menu crashed the app and the article view would not open,
+-- while the plain text viewer (it uses no custom CSS) kept working.
+local function cjkFontFaces()
+    -- one entry per file, the best-looking label of that file
+    local per_file, order = {}, {}
+    for _i, face in ipairs(installedFontFaces()) do
+        if face.cjk and face.base then
+            local cur = per_file[face.base]
+            if not cur then
+                per_file[face.base] = face
+                table.insert(order, face.base)
+            elseif familyLabelScore(face) > familyLabelScore(cur) then
+                per_file[face.base] = face
+            end
+        end
+    end
+    local out = {}
+    for _i, base in ipairs(order) do
+        table.insert(out, per_file[base])
+    end
+    table.sort(out, function(a, b)
+        local ak, bk = a.key or "", b.key or ""
+        local a_style = (ak:find("bold", 1, true) or ak:find("italic", 1, true)) ~= nil
+        local b_style = (bk:find("bold", 1, true) or bk:find("italic", 1, true)) ~= nil
+        if a_style ~= b_style then return not a_style end
+        local al, bl = familyLabelScore(a), familyLabelScore(b)
+        if al ~= bl then return al > bl end
+        return ak < bk
+    end)
+    return out
+end
+
+-- v157: the family the article is really laid out with. When the chosen one
+-- carries no CJK glyphs and a CJK sibling exists, the sibling wins -- otherwise
+-- every Chinese character stays on the engine's fallback face and the setting
+-- looks like it did nothing. Returns the family to use, the substituted face
+-- (or nil) and the face the name matched before any substitution.
+local effective_family_cache = {}
+
+-- v158: the best label a single font file can be addressed by. A file such as
+-- NotoSerifCJK-Regular.ttc answers to "Noto Serif CJK SC", not to the bare
+-- "Noto Serif" it also reports -- asking for the bare name would land on the
+-- Latin-only NotoSerif-Regular.ttf when both are installed.
+local function cjkLabelOfBase(base)
+    local best, best_label
+    for _i, face in ipairs(installedFontFaces()) do
+        if face.cjk and face.base == base then
+            local label = familyLabelScore(face)
+            if label > 0 and (not best_label or label > best_label) then
+                best, best_label = face, label
+            end
+        end
+    end
+    return best
+end
+
+local function effectiveFontFamily(font_name)
+    if not font_name or font_name == "" then return nil, nil, nil end
+    local raw = plainName(font_name)
+    if raw == "" or FONT_GENERIC_FAMILIES[raw:lower()] then
+        return raw, nil, nil
+    end
+    local cached = effective_family_cache[raw]
+    if cached then return cached[1], cached[2], cached[3] end
+    local first = resolveFontCandidates(raw)[1]
+    local out
+    if first and first.cjk then
+        -- v158: the chosen name already resolves to a Chinese-capable file; use
+        -- that file's own family name so the CSS cannot land on a Latin-only
+        -- namesake.
+        local label_face = cjkLabelOfBase(first.base)
+        if label_face and label_face.family ~= raw then
+            out = { label_face.family, label_face, first }
+        else
+            out = { raw, nil, first }
+        end
+    else
+        local sibling = bestCjkFace(raw)
+        if sibling and sibling.family and sibling.family ~= "" then
+            out = { sibling.family, sibling, first }
+        else
+            out = { raw, nil, first }
+        end
+    end
+    effective_family_cache[raw] = out
+    return out[1], out[2], out[3]
+end
+
+-- CSS tokens the layout engine can try, in order.
+local function fontFamilyAliases(name, max_faces)
+    local aliases = {}
+    if not name or name == "" then return aliases end
+    local raw = plainName(name)
+    if raw == "" or FONT_GENERIC_FAMILIES[raw:lower()] then return aliases end
+    local seen = {}
+    local function add(token)
+        if token and token ~= "" and not seen[token] then
+            seen[token] = true
+            table.insert(aliases, token)
+        end
+    end
+    -- without spaces: some lookups compare the requested string against file
+    -- names verbatim, where "Noto Serif CJK SC" can never match a file name
+    local tight = raw:gsub("%s+", "")
+    if tight ~= raw then add('"' .. tight .. '"') end
+    -- v156: MuPDF resolves a family name by looking for a font file of that
+    -- name, so the file name exactly as it sits on disk (extension included,
+    -- e.g. "NotoSansCJK-Regular.ttc") is tried first; then the bare file name,
+    -- then the family the file reports. Anything after that is a long shot.
+    -- v157: earlier builds emitted every candidate (36 faces x 3 tokens), which
+    -- buried the CJK-capable face and made the rule unreadable. Chinese-capable
+    -- files go first, then the name matches, and only a few of each.
+    local counted = 0
+    local function addCandidates(list, quota)
+        local used = 0
+        for _i, face in ipairs(list) do
+            if used >= (quota or 2) or counted >= (max_faces or 4) then return end
+            used = used + 1
+            counted = counted + 1
+            add('"' .. face.base .. '"')
+            add('"' .. (face.base:gsub("%.[%w]+$", "")) .. '"')
+            if face.family and face.family ~= "" then
+                add('"' .. face.family .. '"')
+            end
+        end
+    end
+    -- v158: the face the chosen name resolves to comes first -- effectiveFontFamily
+    -- has already swapped a Latin-only family for its CJK sibling, so this is
+    -- normally a Chinese-capable face. The device's CJK faces are only a
+    -- fallback, and they must not eat the whole quota (v157 did that, so the
+    -- family the user actually picked could end up outside the CSS).
+    local primary = resolveFontCandidates(raw)
+    if #primary == 0 then
+        addCandidates(cjkFontFaces(), 3)
+    else
+        addCandidates(primary, 2)
+        addCandidates(cjkFontFaces(), 1)
+    end
+    return aliases
+end
+
+-- v156: userFontFaceCss() was removed with the @font-face approach above.
+-- absoluteFontPath() stays: it is the only place that turns the relative
+-- "./fonts/x.ttf" form from fontlist into a path, and the diagnostics panel
+-- reports it.
 
 -- CSS for ScrollHtmlWidget article rendering
 -- __FONT_FAMILY__ is substituted by buildArticleCss().
@@ -351,11 +860,29 @@ h2, h3 {
 -- v146: para_indent is the first-line indent of a paragraph, in characters:
 -- 0 = flush left, 2 = the classic two-character indent.
 local function buildArticleCss(font_name, para_indent)
-    local family = DEFAULT_CJK_FONT_STACK
-    local chosen = cssFontFamily(font_name)
+    -- v155: offer the chosen family, its file-name aliases, and then the built-in
+    -- CJK stack. The engine picks the first entry it can actually resolve, while
+    -- a resolvable face always wins over the fallback stack for Latin text.
+    -- v157: the first family must be one that can draw Chinese. "Noto Serif" is
+    -- Latin-only, so Chinese used to fall back to the built-in face and the
+    -- setting looked ignored; a CJK sibling is used instead when available.
+    local used_name = effectiveFontFamily(font_name)
+    local families = {}
+    local chosen = cssFontFamily(used_name)
     if chosen then
-        family = chosen .. ", " .. DEFAULT_CJK_FONT_STACK
+        table.insert(families, chosen)
+        for _i, alias in ipairs(fontFamilyAliases(used_name, 4)) do
+            if alias ~= chosen then table.insert(families, alias) end
+        end
     end
+    -- The literal choice stays last: if its file exists but no CJK sibling does,
+    -- Latin text still gets exactly what was asked for.
+    local original = cssFontFamily(font_name)
+    if original and original ~= chosen then
+        table.insert(families, original)
+    end
+    table.insert(families, DEFAULT_CJK_FONT_STACK)
+    local family = table.concat(families, ", ")
     local indent = "2em"
     if para_indent == 0 then indent = "0" end
     local css = ARTICLE_CSS_TEMPLATE:gsub("__FONT_FAMILY__", function() return family end)
@@ -418,10 +945,14 @@ function Zhihu:addToMainMenu(menu_items)
     }
 end
 
+-- Top level stays short: account first, then three grouped submenus,
+-- then "Settings" (which holds feed batch size, the current-settings summary
+-- and the About page), and Logout last.
 function Zhihu:buildMenuItems()
     local sub_items = {}
     local logged_in = self.client:isLoggedIn()
 
+    -- ---------------------------------------------------------------- account
     if logged_in then
         local user_name = self.cached_user_name
         if not user_name then
@@ -435,10 +966,6 @@ function Zhihu:buildMenuItems()
             text = _("推荐流 (Recommended Feed)"),
             callback = function() self:showRecommendFeed() end,
         })
-        table.insert(sub_items, {
-            text = _("退出登录 (Logout)"),
-            callback = function() self:doLogout() end,
-        })
     else
         table.insert(sub_items, {
             text = _("扫码登录 (Login with QR Code)"),
@@ -446,177 +973,290 @@ function Zhihu:buildMenuItems()
         })
     end
 
+    -- ---------------------------------------------------------------- reading
     table.insert(sub_items, {
-        text = "Font Size",
+        text = _("阅读设置 (Reading)"),
         sub_item_table = {
-            {text = _("小 (Small 18)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 18 end,
-             callback = function() self.settings:saveSetting("font_size", 18) self.updated = true end},
-            {text = _("中 (Medium 22)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 22 end,
-             callback = function() self.settings:saveSetting("font_size", 22) self.updated = true end},
-            {text = _("大 (Large 26)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 26 end,
-             callback = function() self.settings:saveSetting("font_size", 26) self.updated = true end},
-            {text = _("特大 (Extra Large 30)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 30 end,
-             callback = function() self.settings:saveSetting("font_size", 30) self.updated = true end},
+            {
+                text = _("字号 (Font Size)"),
+                sub_item_table = {
+                    {text = _("小 (Small 18)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 18 end,
+                     callback = function() self.settings:saveSetting("font_size", 18) self.updated = true end},
+                    {text = _("中 (Medium 22)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 22 end,
+                     callback = function() self.settings:saveSetting("font_size", 22) self.updated = true end},
+                    {text = _("大 (Large 26)"),  checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 26 end,
+                     callback = function() self.settings:saveSetting("font_size", 26) self.updated = true end},
+                    {text = _("特大 (Extra Large 30)"), checked_func = function() return self.settings:readSetting("font_size", DEFAULT_FONT_SIZE) == 30 end,
+                     callback = function() self.settings:saveSetting("font_size", 30) self.updated = true end},
+                },
+            },
+            {
+                text = _("字体族 (Font Family)"),
+                sub_item_table_func = function() return self:buildFontMenu() end,
+            },
+            {
+                text = _("段落缩进 (Paragraph Indent)"),
+                sub_item_table = {
+                    {text = _("不缩进（贴最左）/ No Indent"),
+                     checked_func = function() return self:getParaIndent() == 0 end,
+                     callback = function()
+                         self.settings:saveSetting("para_indent", 0)
+                         self.updated = true
+                     end},
+                    {text = _("缩进两个汉字 / Indent 2 Chars"),
+                     checked_func = function() return self:getParaIndent() == DEFAULT_PARA_INDENT end,
+                     callback = function()
+                         self.settings:saveSetting("para_indent", DEFAULT_PARA_INDENT)
+                         self.updated = true
+                     end},
+                },
+            },
+            {
+                text = _("显示图片 (Show Images)"),
+                checked_func = function() return self.settings:readSetting("show_images", false) end,
+                callback = function()
+                    local current = self.settings:readSetting("show_images", false)
+                    self.settings:saveSetting("show_images", not current)
+                    self.updated = true
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Show images: %1"), not current and _("On") or _("Off")),
+                        timeout = 2,
+                    })
+                end,
+            },
+            {
+                text = _("回答问题人头像 (Answerer Avatar)"),
+                checked_func = function() return self:getShowAvatar() end,
+                callback = function()
+                    local current = self:getShowAvatar()
+                    self.settings:saveSetting("show_avatar", not current)
+                    self.updated = true
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Answerer avatar: %1"), not current and _("On") or _("Off")),
+                        timeout = 2,
+                    })
+                end,
+            },
+            {
+                text = _("头像大小 (Avatar Size)"),
+                enabled_func = function() return self:getShowAvatar() end,
+                sub_item_table = {
+                    {text = _("小（正文 3 倍）/ Small (3x)"),
+                     checked_func = function() return self:getAvatarScale() == 3 end,
+                     callback = function() self.settings:saveSetting("avatar_scale", 3) self.updated = true end},
+                    {text = _("大（正文 4 倍，默认）/ Large (4x, Default)"),
+                     checked_func = function() return self:getAvatarScale() == DEFAULT_AVATAR_SCALE end,
+                     callback = function() self.settings:saveSetting("avatar_scale", DEFAULT_AVATAR_SCALE) self.updated = true end},
+                    {text = _("超大（正文 5 倍）/ Extra Large (5x)"),
+                     checked_func = function() return self:getAvatarScale() == 5 end,
+                     callback = function() self.settings:saveSetting("avatar_scale", 5) self.updated = true end},
+                },
+            },
         },
     })
 
+    -- ---------------------------------------------------------- layout/refresh
     table.insert(sub_items, {
-        text = _("段落首行缩进 (Paragraph Indent)"),
+        text = _("排版与刷新 (Layout & Refresh)"),
         sub_item_table = {
-            {text = _("不缩进（贴最左）/ No Indent"),
-             checked_func = function() return self:getParaIndent() == 0 end,
-             callback = function()
-                 self.settings:saveSetting("para_indent", 0)
-                 self.updated = true
-             end},
-            {text = _("缩进两个汉字 / Indent 2 Chars"),
-             checked_func = function() return self:getParaIndent() == DEFAULT_PARA_INDENT end,
-             callback = function()
-                 self.settings:saveSetting("para_indent", DEFAULT_PARA_INDENT)
-                 self.updated = true
-             end},
+            {
+                text = _("图片排版 (Picture Layout)"),
+                sub_item_table = {
+                    {text = _("图片与上下文字留白（默认）/ Margin (Default)"),
+                     checked_func = function() return not self:getImagePageBreak() end,
+                     callback = function()
+                         self.settings:saveSetting("image_page_break", false)
+                         self.updated = true
+                     end},
+                    {text = _("图片单独占一页（另起页显示）/ Own Page"),
+                     checked_func = function() return self:getImagePageBreak() end,
+                     callback = function()
+                         self.settings:saveSetting("image_page_break", true)
+                         self.updated = true
+                     end},
+                },
+            },
+            {
+                text = _("刷新模式 (Refresh Mode)"),
+                sub_item_table = {
+                    {text = _("全刷 (Full Refresh)"),
+                     checked_func = function() return self:getRefreshMode() == "full" end,
+                     callback = function()
+                         self:setRefreshMode("full")
+                     end},
+                    {text = _("局刷 (Partial Refresh)"),
+                     checked_func = function() return self:getRefreshMode() == "partial" end,
+                     callback = function()
+                         self:setRefreshMode("partial")
+                     end},
+                    {text = T(_("局部刷新 %1 次后全刷 (Partial x %1, then Full)"), REFRESH_PARTIAL_COUNT),
+                     checked_func = function() return self:getRefreshMode() == "partial_n" end,
+                     callback = function()
+                         self:setRefreshMode("partial_n")
+                     end},
+                    {text = _("Regal 刷新 (Regal, Default)"),
+                     checked_func = function() return self:getRefreshMode() == "regal" end,
+                     callback = function()
+                         self:setRefreshMode("regal")
+                     end},
+                },
+            },
         },
     })
 
+    -- ----------------------------------------------------------- cache/export
     table.insert(sub_items, {
-        text = _("图片排版 (Picture Layout)"),
+        text = _("缓存与导出 (Cache & Export)"),
         sub_item_table = {
-            {text = _("图片与上下文字留白（默认）/ Margin (Default)"),
-             checked_func = function() return not self:getImagePageBreak() end,
-             callback = function()
-                 self.settings:saveSetting("image_page_break", false)
-                 self.updated = true
-             end},
-            {text = _("图片单独占一页（另起页显示）/ Own Page"),
-             checked_func = function() return self:getImagePageBreak() end,
-             callback = function()
-                 self.settings:saveSetting("image_page_break", true)
-                 self.updated = true
-             end},
+            {
+                text = _("查看图片 (View Images)"),
+                enabled_func = function()
+                    return self.current_article ~= nil
+                        and self.current_article.image_list
+                        and #self.current_article.image_list > 0
+                end,
+                callback = function() self:showImages() end,
+            },
+            {
+                text = _("清除图片缓存 (Clear Image Cache)"),
+                callback = function() self:clearCache() end,
+            },
+            {
+                text = _("清除页面缓存 (Clear Page Cache)"),
+                callback = function() self:clearPageCache() end,
+            },
+            {
+                text = _("导出 HTML (Export HTML)"),
+                enabled_func = function() return self.current_article ~= nil end,
+                callback = function() self:exportHtml() end,
+            },
+            {
+                text = _("导出 EPUB (Export EPUB)"),
+                enabled_func = function() return self.current_article ~= nil end,
+                callback = function() self:exportEpub() end,
+            },
         },
     })
 
+    -- --------------------------------------------------------------- settings
+    -- Feed batch size, the current-settings summary and About all live here,
+    -- so the top level keeps only what is used while reading.
     table.insert(sub_items, {
-        text = _("刷新模式 (Refresh Mode)"),
+        text = _("设置 (Settings)"),
         sub_item_table = {
-            {text = _("全刷 (Full Refresh)"),
-             checked_func = function() return self:getRefreshMode() == "full" end,
-             callback = function()
-                 self:setRefreshMode("full")
-             end},
-            {text = _("局刷 (Partial Refresh)"),
-             checked_func = function() return self:getRefreshMode() == "partial" end,
-             callback = function()
-                 self:setRefreshMode("partial")
-             end},
-            {text = T(_("局部刷新 %1 次后全刷 (Partial x %1, then Full)"), REFRESH_PARTIAL_COUNT),
-             checked_func = function() return self:getRefreshMode() == "partial_n" end,
-             callback = function()
-                 self:setRefreshMode("partial_n")
-             end},
-            {text = _("Regal 刷新 (Regal, Default)"),
-             checked_func = function() return self:getRefreshMode() == "regal" end,
-             callback = function()
-                 self:setRefreshMode("regal")
-             end},
+            {
+                text = _("推荐流条数 (Feed Batch Size)"),
+                sub_item_table_func = function()
+                    local batch_items = {}
+                    for n = FEED_BATCH_MIN, FEED_BATCH_MAX, FEED_BATCH_STEP do
+                        -- capture the value per iteration: every entry keeps its own n
+                        local val = n
+                        local label
+                        if val == DEFAULT_FEED_BATCH then
+                            label = T(_("%1 条（默认）/ %1 items (Default)"), val)
+                        else
+                            label = T(_("%1 条 / %1 items"), val)
+                        end
+                        table.insert(batch_items, {
+                            text = label,
+                            checked_func = function() return self:getFeedBatch() == val end,
+                            callback = function() self:setFeedBatch(val) end,
+                        })
+                    end
+                    return batch_items
+                end,
+            },
+            {
+                text = _("当前设置一览 (Current Settings)"),
+                callback = function() self:showSettingsSummary() end,
+            },
+            {
+                text = _("关于 (About)"),
+                callback = function() self:showAbout() end,
+            },
         },
     })
 
-    table.insert(sub_items, {
-        text = _("显示回答问题人头像 (Answerer Avatar)"),
-        checked_func = function() return self:getShowAvatar() end,
-        callback = function()
-            local current = self:getShowAvatar()
-            self.settings:saveSetting("show_avatar", not current)
-            self.updated = true
-            UIManager:show(InfoMessage:new{
-                text = T(_("Answerer avatar: %1"), not current and _("On") or _("Off")),
-                timeout = 2,
-            })
-        end,
-    })
-
-    table.insert(sub_items, {
-        text = _("头像大小 (Avatar Size)"),
-        sub_item_table = {
-            {text = _("小（正文 3 倍）/ Small (3x)"),
-             checked_func = function() return self:getAvatarScale() == 3 end,
-             callback = function() self.settings:saveSetting("avatar_scale", 3) self.updated = true end},
-            {text = _("大（正文 4 倍，默认）/ Large (4x, Default)"),
-             checked_func = function() return self:getAvatarScale() == DEFAULT_AVATAR_SCALE end,
-             callback = function() self.settings:saveSetting("avatar_scale", DEFAULT_AVATAR_SCALE) self.updated = true end},
-            {text = _("超大（正文 5 倍）/ Extra Large (5x)"),
-             checked_func = function() return self:getAvatarScale() == 5 end,
-             callback = function() self.settings:saveSetting("avatar_scale", 5) self.updated = true end},
-        },
-    })
-
-    table.insert(sub_items, {
-        text = _("字体设置 (Font Family)"),
-        sub_item_table_func = function() return self:buildFontMenu() end,
-    })
-
-    table.insert(sub_items, {
-        text = _("显示图片 (Show Images)"),
-        checked_func = function() return self.settings:readSetting("show_images", false) end,
-        callback = function()
-            local current = self.settings:readSetting("show_images", false)
-            self.settings:saveSetting("show_images", not current)
-            self.updated = true
-            UIManager:show(InfoMessage:new{
-                text = T(_("Show images: %1"), not current and _("On") or _("Off")),
-                timeout = 2,
-            })
-        end,
-    })
-
-    table.insert(sub_items, {
-        text = _("查看图片 (View Images)"),
-        enabled_func = function()
-            return self.current_article ~= nil
-                and self.current_article.image_list
-                and #self.current_article.image_list > 0
-        end,
-        callback = function() self:showImages() end,
-    })
-
-    table.insert(sub_items, {
-        text = _("清除图片缓存 (Clear Image Cache)"),
-        callback = function() self:clearCache() end,
-    })
-
-    table.insert(sub_items, {
-        text = _("清除页面缓存 (Clear Page Cache)"),
-        callback = function() self:clearPageCache() end,
-    })
-
-    table.insert(sub_items, {
-        text = _("导出 HTML (Export HTML)"),
-        enabled_func = function()
-            return self.current_article ~= nil
-        end,
-        callback = function() self:exportHtml() end,
-    })
-
-    table.insert(sub_items, {
-        text = _("导出 EPUB (Export EPUB)"),
-        enabled_func = function()
-            return self.current_article ~= nil
-        end,
-        callback = function() self:exportEpub() end,
-    })
-
-    table.insert(sub_items, {
-        text = _("关于 (About)"),
-        callback = function()
-            UIManager:show(InfoMessage:new{
-                text = _("Zhihu Reader v140\n\n- QR code login (auto-complete)\n- Risk-control verification flow (browser)\n- Recommended feed: 12 items per batch\n- Answers: 5 per page, 'Next' button for more\n- Lightweight HTML for smooth page turns\n- Page cache: 1 hour on disk\n- Font family + font size settings\n- All images load (downscaled to screen)\n- Image cache: download once, reuse\n- Mixed text and images\n- Export to HTML & EPUB (auto-open)"),
-                timeout = 5,
-            })
-        end,
-    })
+    if logged_in then
+        table.insert(sub_items, {
+            text = _("退出登录 (Logout)"),
+            callback = function() self:doLogout() end,
+        })
+    end
 
     return sub_items
+end
+
+-- Current settings at a glance: answers "why does it look like this?" without
+-- digging through every submenu.
+function Zhihu:showSettingsSummary()
+    local font_name = self:getFontName()
+    local font_line
+    if not font_name or font_name == "" then
+        font_line = _("自动选择 (Auto)")
+    else
+        local used = effectiveFontFamily(font_name)
+        if used and used ~= font_name then
+            font_line = font_name .. " -> " .. used
+        else
+            font_line = font_name
+        end
+    end
+    local lines = {
+        _("【阅读】"),
+        _("字号：") .. tostring(self.settings:readSetting("font_size", DEFAULT_FONT_SIZE)),
+        _("字体：") .. font_line,
+        _("段落缩进：") .. (self:getParaIndent() == 0 and _("不缩进") or _("缩进两个汉字")),
+        _("显示图片：") .. (self.settings:readSetting("show_images", false) and _("开") or _("关")),
+        _("头像：") .. (self:getShowAvatar() and _("显示") or _("隐藏"))
+            .. _("，大小 ") .. tostring(self:getAvatarScale()) .. _(" 倍"),
+        _("图片排版：") .. (self:getImagePageBreak() and _("单独占页") or _("上下留白")),
+        _("刷新模式：") .. tostring(self:getRefreshMode()),
+        "",
+        _("【推荐流】"),
+        _("每批条数：") .. tostring(self:getFeedBatch()) .. _(" 条"),
+        "",
+        _("【账号与缓存】"),
+        _("登录状态：") .. (self.client:isLoggedIn() and _("已登录") or _("未登录")),
+        _("页面缓存：") .. T(_("%1 分钟后过期"), math.floor(DEFAULT_CACHE_TTL / 60)),
+    }
+    -- TextViewer, not InfoMessage: the list is longer than the height of a
+    -- small e-ink screen and must be scrollable.
+    UIManager:show(TextViewer:new{
+        title = _("当前设置一览 (Current Settings)"),
+        text = table.concat(lines, "\n"),
+    })
+end
+
+-- About page: short lines, grouped by what the user actually does.
+function Zhihu:showAbout()
+    local lines = {
+        _("在 KOReader 上读知乎。扫码一次，之后直接翻页看推荐流和回答。"),
+        "",
+        _("【能做什么】"),
+        _("- 扫码登录：手机确认后自动完成"),
+        _("- 推荐流：每批 6~36 条可调，看完接着加载"),
+        _("- 回答分页阅读，文字与图片混排"),
+        _("- 图片按文章缓存，重开不再重新下载"),
+        _("- 字号、字体、缩进、图片排版、刷新方式可调"),
+        _("- 导出 HTML / EPUB 到本机"),
+        "",
+        _("【怎么用】"),
+        _("- 首次使用：菜单里点「扫码登录」"),
+        _("- 阅读中：左右翻页，上下滑动退出"),
+        _("- 已打开的文章改了设置不会自动刷新，重新打开即可"),
+        _("- 网络慢或想省电：在阅读设置里关掉「显示图片」"),
+        "",
+        _("【数据存放】"),
+        _("- 图片缓存：数据目录 / zhihu_article_images/"),
+        _("- 页面缓存：1 小时后自动过期"),
+        "",
+        _("项目主页：github.com/asuplive/zhihu.koplugin"),
+    }
+    UIManager:show(TextViewer:new{
+        title = T(_("关于 (About) · 知乎阅读器 %1"), PLUGIN_VERSION),
+        text = table.concat(lines, "\n"),
+    })
 end
 
 -- =========================================================================
@@ -950,11 +1590,17 @@ function Zhihu:_loadFeedMenu(items, title, show_more)
         })
     end
 
+    -- v155: the setting only ever reached the article CSS, so the feed itself
+    -- kept the KOReader menu face. Carry it into the menu as well: the feed is
+    -- the "content" the reader sees first, it has to use the chosen family.
+    local feed_face = self:getUiFontFace()
+
     local menu = Menu:new{
         title = title,
         item_table = menu_items,
         covers_fullscreen = true,
         is_borderless = true,
+        font = feed_face or "smallinfofont",
     }
 
     local plugin = self
@@ -994,9 +1640,13 @@ function Zhihu:_loadRecommendFeed(start_url)
     local loading = InfoMessage:new{text = _("Loading..."), timeout = 0}
     UIManager:show(loading)
 
-    -- v127: fetch up to 3 pages behind the scenes, but the list is capped
-    -- at 12 items (client-side limit); "Load More" continues from the cursor.
-    local items, next_url = self.client:getRecommendFeed(start_url, 3)
+    -- v127: fetch several pages behind the scenes and cap the list at the
+    -- configured batch size; "Load More" continues from the cursor.
+    -- v159: both the item cap and the page budget follow the "Feed Batch Size"
+    -- setting (6 / 12 / 18 / 24 / 30 / 36 -- multiples of 6), 12 by default.
+    local batch = self:getFeedBatch()
+    local pages = self:feedPagesForBatch(batch)
+    local items, next_url = self.client:getRecommendFeed(start_url, pages, batch)
     UIManager:close(loading)
 
     if not items then
@@ -1337,7 +1987,46 @@ end
 
 function Zhihu:setFontName(name)
     self.settings:saveSetting("font_family", name or "")
+    -- v155: the resolved UI face is cached per name, drop it on any change
+    self._ui_face_cache = nil
+    -- v157: so is the family the article is laid out with
+    effective_family_cache = {}
     self.updated = true
+end
+
+-- v155: the feed list is a plain KOReader Menu and painted with its own face,
+-- so it ignored the Font Family setting entirely. Resolve the chosen family to
+-- an installed font file that ui/font can really load, and only return a name
+-- after Font:getFace() has accepted it (a bad name would make the menu crash).
+function Zhihu:getUiFontFace()
+    local name = self:getFontName()
+    if not name then return nil end
+    if FONT_GENERIC_FAMILIES[name:lower()] then return nil end
+    local cache = self._ui_face_cache
+    if cache and cache.name == name then return cache.face end
+
+    -- v157: a Latin-only family ("Noto Serif") would render every Chinese
+    -- title in the feed as tofu boxes, so load its CJK sibling instead.
+    local lookup = effectiveFontFamily(name) or name
+    -- installed candidates first (best score first), then whatever the user
+    -- typed, so a font that is not in the scan list can still be tried
+    local candidates = {}
+    for _i, installed in ipairs(resolveFontCandidates(lookup)) do
+        table.insert(candidates, installed.base)
+    end
+    table.insert(candidates, lookup)
+    if lookup ~= name then table.insert(candidates, name) end
+
+    local face = nil
+    for _i, candidate in ipairs(candidates) do
+        local ok, got = pcall(Font.getFace, Font, candidate, 20)
+        if ok and got then
+            face = candidate
+            break
+        end
+    end
+    self._ui_face_cache = { name = name, face = face }
+    return face
 end
 
 -- v148: should a content picture start on a page of its own?
@@ -1371,6 +2060,44 @@ function Zhihu:setRefreshMode(mode)
         text = T(_("Refresh mode: %1"), labels[mode] or mode),
         timeout = 2,
     })
+end
+
+-- v159: how many items one recommended-feed batch holds. Always a multiple of
+-- FEED_BATCH_STEP, clamped to [FEED_BATCH_MIN, FEED_BATCH_MAX]; a missing or
+-- unusable stored value falls back to the old hard-coded 12.
+function Zhihu:getFeedBatch()
+    local v = tonumber(self.settings:readSetting("feed_batch", DEFAULT_FEED_BATCH))
+    if not v or v ~= v then v = DEFAULT_FEED_BATCH end -- nil / NaN guard
+    v = math.floor(v / FEED_BATCH_STEP + 0.5) * FEED_BATCH_STEP
+    if v < FEED_BATCH_MIN then
+        v = FEED_BATCH_MIN
+    elseif v > FEED_BATCH_MAX then
+        v = FEED_BATCH_MAX
+    end
+    return v
+end
+
+function Zhihu:setFeedBatch(n)
+    n = math.floor((tonumber(n) or DEFAULT_FEED_BATCH) / FEED_BATCH_STEP + 0.5) * FEED_BATCH_STEP
+    if n < FEED_BATCH_MIN then
+        n = FEED_BATCH_MIN
+    elseif n > FEED_BATCH_MAX then
+        n = FEED_BATCH_MAX
+    end
+    self.settings:saveSetting("feed_batch", n)
+    self.updated = true
+    UIManager:show(InfoMessage:new{
+        text = T(_("Feed batch size: %1 items"), n),
+        timeout = 2,
+    })
+end
+
+-- v159: how many API pages to walk before a batch of `n` items can be full.
+-- Each page carries 20 raw cards, but video / promotion / live / roundtable
+-- cards are dropped, so only a fraction survives: 3 pages used to be enough
+-- for the old 12-item batch, hence one extra page per extra 4 items.
+function Zhihu:feedPagesForBatch(n)
+    return math.max(3, math.ceil(n / 4))
 end
 
 -- v146: first-line indent of a paragraph, in characters (0 or 2).
@@ -1508,6 +2235,137 @@ function Zhihu:_inlineAvatars(html, dir)
     return html, used
 end
 
+-- v155: say what the chosen family resolved to on THIS device. The old message
+-- only claimed the setting was saved, so a name that matched no font file looked
+-- identical to a working one - which is why "the font does not apply" was
+-- impossible to diagnose from the device itself.
+function Zhihu:_fontMatchHint(name)
+    if not name then return _("使用内置中文字体栈") end
+    if FONT_GENERIC_FAMILIES[name:lower()] then
+        return _("通用字体族，由系统决定具体字体")
+    end
+    local candidates = resolveFontCandidates(name)
+    -- v157: a matched file is not the same as a matched file that can draw
+    -- Chinese -- "Noto Serif" matches 36 faces and still changes nothing.
+    local used, sibling = effectiveFontFamily(name)
+    local lines = {}
+    if sibling then
+        table.insert(lines, T(_("「%1」不含汉字字形，正文改用 %2"), name, used))
+    end
+    if #candidates > 0 then
+        local face = candidates[1]
+        if face.family and face.family ~= "" and face.family ~= face.base then
+            table.insert(lines, T(_("已匹配字体文件：%1（%2）"), face.base, face.family))
+        else
+            table.insert(lines, T(_("已匹配字体文件：%1"), face.base))
+        end
+    else
+        table.insert(lines, _("本机字体目录未找到同名文件，将按字体名交给渲染引擎"))
+    end
+    return table.concat(lines, "\n")
+end
+
+function Zhihu:_showFontApplied(name)
+    UIManager:show(InfoMessage:new{
+        text = T(_("字体：%1（重新打开文章/推荐流生效）"), name)
+            .. "\n" .. self:_fontMatchHint(name)
+            .. "\n" .. _("若正文仍是默认字体，请点「字体诊断」"),
+        timeout = 3,
+    })
+end
+
+-- v156: what the layout engine is actually handed on THIS device. The toast
+-- could only say "a font file was matched", which is not the same thing as
+-- "the engine drew with it": the article is laid out by MuPDF, which resolves
+-- a family name against its own font search path and ignores @font-face. This
+-- panel prints the resolved face, the file count and the final CSS, so a bad
+-- family name can be told apart from an engine that will not take a custom
+-- face at all -- instead of another round of "it still does not work".
+function Zhihu:showFontDiagnostics()
+    local name = self:getFontName()
+    local lines = {}
+    table.insert(lines, T(_("设置字体 / Setting: %1"), name or _("默认 / default")))
+
+    local ok_engine, Mupdf = pcall(require, "mupdf")
+    if ok_engine and Mupdf then
+        local ver = nil
+        if type(Mupdf.version) == "function" then
+            local ok_v, v = pcall(Mupdf.version)
+            if ok_v then ver = v end
+        elseif Mupdf.version ~= nil then
+            ver = Mupdf.version
+        end
+        if ver then table.insert(lines, T(_("渲染引擎 / Engine: MuPDF %1"), tostring(ver)))
+        else table.insert(lines, _("渲染引擎 / Engine: MuPDF")) end
+    end
+
+    local ok_list, FontList = pcall(require, "fontlist")
+    if ok_list and FontList and FontList.getFontList then
+        local ok_2, list = pcall(FontList.getFontList, FontList)
+        if ok_2 and type(list) == "table" then
+            table.insert(lines, T(_("设备字体文件数 / Font files: %1"), #list))
+        end
+    end
+
+    if name and not FONT_GENERIC_FAMILIES[name:lower()] then
+        local cands = resolveFontCandidates(name)
+        -- v157: which family is really used, and can it draw Chinese at all?
+        local used, sibling, first = effectiveFontFamily(name)
+        local chosen_cjk = first and first.cjk
+        local cjk_text = _("未知 / unknown")
+        if chosen_cjk == true then cjk_text = _("是 / yes")
+        elseif chosen_cjk == false then cjk_text = _("否 / no") end
+        table.insert(lines, T(_("所选族名含汉字 / Chosen family has CJK: %1"), cjk_text))
+        table.insert(lines, T(_("正文实际字体 / Family used: %1"), tostring(used)))
+        if sibling then
+            table.insert(lines, T(_("  （已自动换成含汉字的同族字体：%1）"), sibling.base))
+        end
+        local cjk_faces = cjkFontFaces()
+        table.insert(lines, T(_("设备含汉字字体文件数 / CJK-capable files: %1"), #cjk_faces))
+        table.insert(lines, T(_("匹配候选 / Matching faces: %1"), #cands))
+        for i = 1, math.min(#cands, 5) do
+            local face = cands[i]
+            local tag = _("未知")
+            if face.cjk == true then tag = _("含中文")
+            elseif face.cjk == false then tag = _("仅西文") end
+            table.insert(lines, string.format("  %d) [%s] %s | %s", i, tag,
+                tostring(face.base), tostring(face.family or "?")))
+            local abs = absoluteFontPath(face.path)
+            if abs then table.insert(lines, "     " .. abs) end
+        end
+        if #cands == 0 then
+            table.insert(lines, _("  （本机找不到该字体的文件）"))
+        end
+    end
+
+    table.insert(lines, _("正文 CSS / Article CSS:"))
+    local css = buildArticleCss(name, self:getParaIndent())
+    local family = css:match("font%-family:%s*([^;]+);") or "(none)"
+    table.insert(lines, "  " .. family)
+
+    UIManager:show(TextViewer:new{
+        title = _("字体诊断 / Font diagnostics"),
+        text = table.concat(lines, "\n"),
+        text_face = Font:getFace("cfont", 18),
+        justified = false,
+    })
+end
+
+-- v157: the families on THIS device that can actually draw Chinese, so the
+-- user can pick one that exists instead of typing a name that does not.
+function Zhihu:_deviceCjkFontNames()
+    local seen, out = {}, {}
+    for _i, face in ipairs(cjkFontFaces()) do
+        local fam = face.family
+        if fam and fam ~= "" and not seen[fam] then
+            seen[fam] = true
+            table.insert(out, fam)
+        end
+    end
+    table.sort(out)
+    return out
+end
+
 function Zhihu:buildFontMenu()
     local items = {}
     table.insert(items, {
@@ -1515,18 +2373,49 @@ function Zhihu:buildFontMenu()
         checked_func = function() return self:getFontName() == nil end,
         callback = function()
             self:setFontName(nil)
-            UIManager:show(InfoMessage:new{text = _("字体：默认（重新打开文章生效）"), timeout = 2})
+            UIManager:show(InfoMessage:new{
+                text = _("字体：默认（重新打开文章/推荐流生效）"),
+                timeout = 3,
+            })
         end,
     })
     table.insert(items, {text = "----------------"})
 
-    for _idx, name in ipairs(FONT_PRESETS) do
+    for _idx, preset in ipairs(FONT_PRESETS) do
+        local pname = preset.name
+        local label = pname
+        if preset.latin_only then
+            label = T(_("%1（仅西文） / (Latin only)"), pname)
+        end
         table.insert(items, {
-            text = name,
-            checked_func = function() return self:getFontName() == name end,
+            text = label,
+            checked_func = function() return self:getFontName() == pname end,
             callback = function()
-                self:setFontName(name)
-                UIManager:show(InfoMessage:new{text = T(_("字体：%1（重新打开文章生效）"), name), timeout = 2})
+                self:setFontName(pname)
+                self:_showFontApplied(pname)
+            end,
+        })
+    end
+
+    -- v157: whatever Chinese-capable families the device really has, one tap away.
+    local cjk_fonts = self:_deviceCjkFontNames()
+    if #cjk_fonts > 0 then
+        table.insert(items, {text = "----------------"})
+        table.insert(items, {
+            text = T(_("设备上的中文字体（%1）/ Chinese fonts on device"), #cjk_fonts),
+            sub_item_table_func = function()
+                local sub = {}
+                for _i, fam in ipairs(cjk_fonts) do
+                    table.insert(sub, {
+                        text = fam,
+                        checked_func = function() return self:getFontName() == fam end,
+                        callback = function()
+                            self:setFontName(fam)
+                            self:_showFontApplied(fam)
+                        end,
+                    })
+                end
+                return sub
             end,
         })
     end
@@ -1538,11 +2427,17 @@ function Zhihu:buildFontMenu()
             local n = self:getFontName()
             if not n then return false end
             for _i, preset in ipairs(FONT_PRESETS) do
-                if preset == n then return false end
+                if preset.name == n then return false end
             end
             return true
         end,
         callback = function() self:showFontInput() end,
+    })
+    -- v156: one tap to see what the article is really laid out with
+    table.insert(items, {text = "----------------"})
+    table.insert(items, {
+        text = _("字体诊断（正文为何没变） / Font diagnostics"),
+        callback = function() self:showFontDiagnostics() end,
     })
     return items
 end
@@ -1570,10 +2465,13 @@ function Zhihu:showFontInput()
                         UIManager:close(dialog)
                         if value == "" then
                             self:setFontName(nil)
-                            UIManager:show(InfoMessage:new{text = _("字体：默认（重新打开文章生效）"), timeout = 2})
+                            UIManager:show(InfoMessage:new{
+                                text = _("字体：默认（重新打开文章/推荐流生效）"),
+                                timeout = 3,
+                            })
                         else
                             self:setFontName(value)
-                            UIManager:show(InfoMessage:new{text = T(_("字体：%1（重新打开文章生效）"), value), timeout = 2})
+                            self:_showFontApplied(value)
                         end
                     end,
                 },
